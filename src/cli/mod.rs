@@ -1,6 +1,6 @@
-use crate::crypto::{CryptoSession, KeyExchange};
-use crate::session::{SessionAuth, SessionId, SessionMessage};
-use anyhow::{anyhow, Result};
+use crate::crypto::CryptoSession;
+use crate::session::{ChatMessage, MAX_MESSAGE_LEN};
+use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
@@ -14,158 +14,134 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
-use serde_json;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-pub struct ChatClient {
+const MAX_MESSAGES: usize = 1000;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+pub struct P2PChat {
     username: String,
-    session_id: SessionId,
-    messages: Vec<String>,
+    peer_username: String,
+    messages: VecDeque<String>,
     input: String,
-    crypto_sessions: HashMap<String, CryptoSession>,
-    server_addr: String,
+    crypto: CryptoSession,
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
 }
 
-impl ChatClient {
-    pub fn new(username: String, session_id: SessionId, server_addr: String) -> Self {
+impl P2PChat {
+    pub fn new(
+        username: String,
+        peer_username: String,
+        socket: UdpSocket,
+        peer_addr: SocketAddr,
+        shared_secret: [u8; 32],
+    ) -> Self {
         Self {
             username,
-            session_id,
-            messages: vec![],
+            peer_username,
+            messages: VecDeque::with_capacity(MAX_MESSAGES),
             input: String::new(),
-            crypto_sessions: HashMap::new(),
-            server_addr,
+            crypto: CryptoSession::new(shared_secret),
+            socket: Arc::new(socket),
+            peer_addr,
         }
     }
 
-    pub async fn connect(&mut self, password: &str) -> Result<()> {
-        let stream = TcpStream::connect(&self.server_addr).await?;
-        let (reader, writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
+    fn add_message(&mut self, msg: String) {
+        if self.messages.len() >= MAX_MESSAGES {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(msg);
+    }
 
-        let key_exchange = KeyExchange::new();
-        let our_public_key = key_exchange.public_key().as_bytes().to_vec();
+    pub fn run(&mut self) -> Result<()> {
+        // Set socket to non-blocking for UI thread
+        self.socket.set_nonblocking(true)?;
 
-        let auth = SessionAuth::new(password);
-        let join_msg = SessionMessage::Join {
-            session_id: self.session_id.clone(),
-            password_hash: *auth.hash(),
-            public_key: our_public_key.clone(),
-            username: self.username.clone(),
-        };
+        // Channel for incoming messages
+        let (msg_tx, msg_rx): (Sender<ChatMessage>, Receiver<ChatMessage>) = mpsc::channel();
 
-        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<String>();
-        let (net_tx, mut net_rx) = mpsc::unbounded_channel::<SessionMessage>();
-
-        let mut writer = writer;
-        let join_str = serde_json::to_string(&join_msg)? + "\n";
-        writer.write_all(join_str.as_bytes()).await?;
-        writer.flush().await?;
-
-        let net_tx_clone = net_tx.clone();
-        tokio::spawn(async move {
-            let mut line = String::new();
+        // Spawn receiver thread
+        let socket_clone = Arc::clone(&self.socket);
+        let peer_addr = self.peer_addr;
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if let Ok(msg) = serde_json::from_str::<SessionMessage>(&line) {
-                            net_tx_clone.send(msg).ok();
+                match socket_clone.recv_from(&mut buf) {
+                    Ok((len, from)) => {
+                        if from == peer_addr {
+                            if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&buf[..len]) {
+                                if msg_tx.send(msg).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
-                    Err(_) => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
         });
 
-        tokio::spawn(async move {
-            while let Some(msg) = ui_rx.recv().await {
-                if writer.write_all(msg.as_bytes()).await.is_err() {
-                    break;
-                }
-                if writer.write_all(b"\n").await.is_err() {
-                    break;
-                }
-                if writer.flush().await.is_err() {
-                    break;
-                }
+        // Spawn keepalive thread
+        let socket_keepalive = Arc::clone(&self.socket);
+        let peer_addr_keepalive = self.peer_addr;
+        thread::spawn(move || {
+            let ping = serde_json::to_vec(&ChatMessage::Ping).unwrap();
+            loop {
+                thread::sleep(KEEPALIVE_INTERVAL);
+                let _ = socket_keepalive.send_to(&ping, peer_addr_keepalive);
             }
         });
 
-        if let Some(msg) = net_rx.recv().await {
-            match msg {
-                SessionMessage::JoinAck {
-                    success,
-                    peer_public_keys,
-                } => {
-                    if !success {
-                        return Err(anyhow!("Failed to join session"));
-                    }
+        self.add_message(format!("Connected to {}", self.peer_username));
+        self.add_message(format!(
+            "Your messages are end-to-end encrypted."
+        ));
+        self.add_message(String::new());
 
-                    self.messages
-                        .push(format!("Connected to session {}", self.session_id));
-
-                    for (peer_username, peer_key) in peer_public_keys {
-                        if peer_key.len() == 32 {
-                            let mut peer_public_bytes = [0u8; 32];
-                            peer_public_bytes.copy_from_slice(&peer_key);
-                            let peer_public = x25519_dalek::PublicKey::from(peer_public_bytes);
-                            let shared = key_exchange
-                                .public_key()
-                                .as_bytes()
-                                .iter()
-                                .zip(peer_public.as_bytes().iter())
-                                .map(|(a, b)| a ^ b)
-                                .collect::<Vec<u8>>();
-                            let mut secret = [0u8; 32];
-                            secret.copy_from_slice(&shared[..32]);
-
-                            self.crypto_sessions
-                                .insert(peer_username.clone(), CryptoSession::new(secret));
-                            self.messages
-                                .push(format!("User {} is in the session", peer_username));
-                        }
-                    }
-                }
-                _ => return Err(anyhow!("Unexpected message")),
-            }
-        }
-
-        self.run_ui(ui_tx, net_rx, our_public_key).await
+        self.run_ui(msg_rx)
     }
 
-    async fn run_ui(
-        &mut self,
-        ui_tx: mpsc::UnboundedSender<String>,
-        mut net_rx: mpsc::UnboundedReceiver<SessionMessage>,
-    our_public_key: Vec<u8>,
-    ) -> Result<()> {
+    fn run_ui(&mut self, msg_rx: Receiver<ChatMessage>) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         stdout.execute(Clear(ClearType::All))?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            loop {
-                if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-                    if let Ok(evt) = event::read() {
-                        if event_tx.send(evt).is_err() {
-                            break;
+        let result = loop {
+            // Process incoming messages
+            while let Ok(msg) = msg_rx.try_recv() {
+                match msg {
+                    ChatMessage::Text { ciphertext } => {
+                        if let Ok(plaintext) = self.crypto.decrypt(&ciphertext) {
+                            if let Ok(text) = String::from_utf8(plaintext) {
+                                self.add_message(format!("{}: {}", self.peer_username, text));
+                            }
                         }
+                    }
+                    ChatMessage::Ping => {
+                        let pong = serde_json::to_vec(&ChatMessage::Pong).unwrap();
+                        let _ = self.socket.send_to(&pong, self.peer_addr);
+                    }
+                    ChatMessage::Pong => {
+                        // Keepalive acknowledged
                     }
                 }
             }
-        });
 
-        let result = loop {
             terminal.draw(|f| {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -181,11 +157,12 @@ impl ChatClient {
                     })
                     .collect();
 
-                let messages_list = List::new(messages).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("Session: {} | User: {}", self.session_id, self.username)),
+                let title = format!(
+                    "Chat with {} | You: {} | Press ESC to exit",
+                    self.peer_username, self.username
                 );
+                let messages_list = List::new(messages)
+                    .block(Block::default().borders(Borders::ALL).title(title));
 
                 f.render_widget(messages_list, chunks[0]);
 
@@ -196,73 +173,35 @@ impl ChatClient {
                 f.render_widget(input, chunks[1]);
             })?;
 
-            tokio::select! {
-                Some(evt) = event_rx.recv() => {
-                    if let Event::Key(key) = evt {
-                        match key.code {
-                            KeyCode::Char(c) => {
+            // Handle keyboard input
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            if self.input.len() < MAX_MESSAGE_LEN {
                                 self.input.push(c);
                             }
-                            KeyCode::Backspace => {
-                                self.input.pop();
-                            }
-                            KeyCode::Enter => {
-                                if !self.input.is_empty() {
-                                    let message = self.input.clone();
-                                    self.messages.push(format!("{}: {}", self.username, message));
-
-                                    let plaintext = message.as_bytes();
-                                    if let Some(crypto) = self.crypto_sessions.values().next() {
-                                        if let Ok(encrypted) = crypto.encrypt(plaintext) {
-                                            let msg = SessionMessage::ChatMessage {
-                                                sender: self.username.clone(),
-                                                encrypted_message: encrypted,
-                                            };
-                                            ui_tx.send(serde_json::to_string(&msg).unwrap()).ok();
-                                        }
-                                    }
-
-                                    self.input.clear();
-                                }
-                            }
-                            KeyCode::Esc => {
-                                break Ok(());
-                            }
-                            _ => {}
                         }
-                    }
-                }
-                Some(msg) = net_rx.recv() => {
-                    match msg {
-                        SessionMessage::PeerJoined { username, public_key } => {
-                            if public_key.len() == 32 {
-                                let mut peer_public_bytes = [0u8; 32];
-                                peer_public_bytes.copy_from_slice(&public_key);
-                                let peer_public = x25519_dalek::PublicKey::from(peer_public_bytes);
-                                let shared = our_public_key
-                                    .iter()
-                                    .zip(peer_public.as_bytes().iter())
-                                    .map(|(a, b)| a ^ b)
-                                    .collect::<Vec<u8>>();
-                                let mut secret = [0u8; 32];
-                                secret.copy_from_slice(&shared[..32]);
+                        KeyCode::Backspace => {
+                            self.input.pop();
+                        }
+                        KeyCode::Enter => {
+                            if !self.input.is_empty() {
+                                let message = self.input.clone();
+                                self.add_message(format!("{}: {}", self.username, message));
 
-                                self.crypto_sessions.insert(username.clone(), CryptoSession::new(secret));
-                            }
-                            self.messages.push(format!("{} joined the session", username));
-                        }
-                        SessionMessage::PeerLeft { username } => {
-                            self.crypto_sessions.remove(&username);
-                            self.messages.push(format!("{} left the session", username));
-                        }
-                        SessionMessage::ChatMessage { sender, encrypted_message } => {
-                            if let Some(crypto) = self.crypto_sessions.values().next() {
-                                if let Ok(plaintext) = crypto.decrypt(&encrypted_message) {
-                                    if let Ok(text) = String::from_utf8(plaintext) {
-                                        self.messages.push(format!("{}: {}", sender, text));
+                                if let Ok(ciphertext) = self.crypto.encrypt(message.as_bytes()) {
+                                    let chat_msg = ChatMessage::Text { ciphertext };
+                                    if let Ok(bytes) = serde_json::to_vec(&chat_msg) {
+                                        let _ = self.socket.send_to(&bytes, self.peer_addr);
                                     }
                                 }
+
+                                self.input.clear();
                             }
+                        }
+                        KeyCode::Esc => {
+                            break Ok(());
                         }
                         _ => {}
                     }

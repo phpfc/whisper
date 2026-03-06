@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>t-chat</id>
+    <version>0.1.0</version>
+    <title>t-chat</title>
+    <authors>phpfc</authors>
+    <owners>phpfc</owners>
+    <projectUrl>https://github.com/phpfc/t-chat</projectUrl>
+    <licenseUrl>https://github.com/phpfc/t-chat/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/phpfc/t-chat</projectSourceUrl>
+    <bugTrackerUrl>https://github.com/phpfc/t-chat/issues</bugTrackerUrl>
+    <tags>chat p2p cli encryption e2e terminal secure</tags>
+    <summary>Secure P2P chat in the terminal</summary>
+    <description>
+t-chat is a secure peer-to-peer chat application for the terminal.
+
+## Features
+- Zero configuration - no servers to deploy
+- End-to-end encryption (ChaCha20-Poly1305)
+- Direct P2P connection via UDP hole punching
+- Works across the internet without port forwarding
+
+## Usage
+```
+t-chat create -u yourname -p password    # Create a session
+t-chat join SESSION_CODE -u name -p pass # Join a session
+```
+    </description>
+    <releaseNotes>https://github.com/phpfc/t-chat/releases/tag/v0.1.0</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

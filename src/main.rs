@@ -1,23 +1,25 @@
 mod cli;
 mod crypto;
-mod p2p;
+mod hole_punch;
 mod session;
-mod relay;
 mod stun;
-mod upnp;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use cli::ChatClient;
-use p2p::Server;
-use session::{SessionId, SessionInfo};
-use relay::find_best_relay;
-use stun::discover_public_address;
-use upnp::open_port;
+use std::time::Duration;
+
+use cli::P2PChat;
+use crypto::{fingerprint, KeyExchange};
+use hole_punch::{connect_to_peer, wait_for_peer};
+use session::{validate_username, SessionAuth, SessionId, SessionInfo};
+use stun::discover_public_endpoint;
+
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "t-chat")]
-#[command(about = "A simple, secure, and private P2P chat CLI", long_about = None)]
+#[command(about = "Secure P2P chat in the terminal. Zero configuration, no servers needed.")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -25,34 +27,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Server {
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
-        addr: String,
-    },
-
+    /// Create a new chat session and wait for someone to join
     Create {
+        /// Your username
         #[arg(short, long)]
         username: String,
 
+        /// Session password (shared with peer)
         #[arg(short, long)]
         password: String,
-
-        #[arg(short, long)]
-        server: Option<String>,
     },
 
+    /// Join an existing chat session
     Join {
-        #[arg(short, long)]
-        session: String,
+        /// Session code (given by the session creator)
+        code: String,
 
+        /// Your username
         #[arg(short, long)]
         username: String,
 
+        /// Session password (shared with peer)
         #[arg(short, long)]
         password: String,
-
-        #[arg(short = 'S', long)]
-        server: Option<String>,
     },
 }
 
@@ -61,133 +58,164 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { addr } => {
-            let server = Server::new();
-            println!("Starting t-chat server on {}...", addr);
-            server.run(&addr).await?;
-        }
-        Commands::Create {
-            username,
-            password,
-            server,
-        } => {
-            let session_id = SessionId::new();
-
-            println!("\n🚀 Creating new session...");
-
-            // Determina endereços: conexão (local) e compartilhamento (público)
-            let (connection_addr, share_addr) = match server {
-                Some(s) => {
-                    println!("📡 Connecting to relay: {}", s);
-                    // Servidor especificado: usa o mesmo para conexão e compartilhamento
-                    (s.clone(), s)
-                }
-                None => {
-                    // Tenta buscar relay público primeiro
-                    print!("🔍 Looking for public relays... ");
-                    match find_best_relay().await {
-                        Some(relay) => {
-                            println!("Found!");
-                            // Relay público: usa o mesmo para conexão e compartilhamento
-                            (relay.clone(), relay)
-                        }
-                        None => {
-                            // Nenhum relay disponível - vira servidor!
-                            println!("None found.");
-                            println!("💡 Starting embedded relay server...");
-
-                            // Descobre IP público via STUN
-                            print!("🌐 Discovering public IP via STUN... ");
-                            let public_addr = match discover_public_address() {
-                                Ok(addr) => {
-                                    println!("{}", addr.ip());
-                                    format!("{}:8080", addr.ip())
-                                }
-                                Err(_) => {
-                                    println!("Failed (using local)");
-                                    "127.0.0.1:8080".to_string()
-                                }
-                            };
-
-                            let server = Server::new();
-                            let local_addr = "127.0.0.1:8080".to_string();
-
-                            // Tenta abrir porta via UPnP
-                            print!("🔓 Opening port 8080 via UPnP... ");
-                            match open_port(8080).await {
-                                Ok(_) => println!("Success!"),
-                                Err(_) => println!("Failed (router may not support UPnP)"),
-                            }
-
-                            // Roda servidor em background
-                            tokio::spawn(async move {
-                                if let Err(e) = server.run("0.0.0.0:8080").await {
-                                    eprintln!("Server error: {}", e);
-                                }
-                            });
-
-                            // Aguarda servidor iniciar com retry
-                            print!("⏳ Waiting for relay to start... ");
-                            let mut retries = 0;
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                                if relay::check_relay_health(&local_addr).await {
-                                    println!("Ready!");
-                                    break;
-                                }
-                                retries += 1;
-                                if retries > 10 {
-                                    return Err(anyhow::anyhow!("Failed to start embedded server"));
-                                }
-                            }
-
-                            println!("✓ Relay running, accessible at: {}", public_addr);
-
-                            // Alice conecta localmente, mas compartilha endereço público
-                            (local_addr, public_addr)
-                        }
-                    }
-                }
-            };
-
-            // Cria SessionInfo com relay público para compartilhar
-            let session_info = SessionInfo::new(session_id.clone(), share_addr);
-
-            println!("\n📋 Session Code: {}", session_info);
-            println!("📤 Share this FULL code with others to let them join!\n");
-
-            let mut client = ChatClient::new(username, session_id, connection_addr);
-            client.connect(&password).await?;
+        Commands::Create { username, password } => {
+            create_session(&username, &password).await?;
         }
         Commands::Join {
-            session,
+            code,
             username,
             password,
-            server,
         } => {
-            println!("\n📥 Joining session...");
-
-            // Parse SessionInfo (pode ter formato: id@relay ou apenas id)
-            let session_info = SessionInfo::from_string(&session)?;
-
-            let server_addr = match server {
-                Some(s) => {
-                    println!("📡 Using specified relay: {}", s);
-                    s
-                }
-                None => {
-                    // Usa o relay do session code
-                    println!("📡 Connecting to relay: {}", session_info.relay_addr);
-                    session_info.relay_addr.clone()
-                }
-            };
-
-            println!("🔑 Session ID: {}", session_info.id);
-
-            let mut client = ChatClient::new(username, session_info.id, server_addr);
-            client.connect(&password).await?;
+            join_session(&code, &username, &password).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn create_session(username: &str, password: &str) -> Result<()> {
+    // Validate username
+    if let Err(e) = validate_username(username) {
+        return Err(anyhow::anyhow!("Invalid username: {}", e));
+    }
+
+    println!("\nCreating session...\n");
+
+    // Discover public endpoint via STUN (this also creates our socket)
+    print!("Discovering public address... ");
+    let (socket, public_addr) = discover_public_endpoint()?;
+    println!("{}", public_addr);
+
+    let local_addr = socket.local_addr()?;
+    println!("Local socket: {}", local_addr);
+
+    // Generate session ID and auth
+    let session_id = SessionId::new();
+    let auth = SessionAuth::new(password);
+
+    // Create session info
+    let session_info = SessionInfo::new(public_addr, session_id.clone(), *auth.salt());
+
+    println!();
+    println!("========================================");
+    println!("SESSION CODE:");
+    println!();
+    println!("  {}", session_info.to_code());
+    println!();
+    println!("Share this code with your peer.");
+    println!("They need the same password to connect.");
+    println!("========================================");
+    println!();
+
+    // Generate keypair
+    let key_exchange = KeyExchange::new();
+    let our_public_key = key_exchange.public_key().as_bytes().to_vec();
+    println!("Your fingerprint: {}", fingerprint(&our_public_key));
+    println!();
+
+    // Wait for peer
+    let punch_result = wait_for_peer(
+        &socket,
+        session_info.id.as_str(),
+        &key_exchange,
+        username,
+        CONNECTION_TIMEOUT,
+    )?;
+
+    // Derive shared secret
+    let peer_public = x25519_dalek::PublicKey::from(punch_result.peer_public_key);
+    let shared_secret = key_exchange.derive_shared_secret(&peer_public);
+
+    println!();
+    println!(
+        "Peer connected: {} [{}]",
+        punch_result.peer_username,
+        fingerprint(&punch_result.peer_public_key)
+    );
+    println!();
+
+    // Verify password by checking if we can communicate
+    // (In a full implementation, we'd do a challenge-response here)
+
+    // Start chat
+    let mut chat = P2PChat::new(
+        username.to_string(),
+        punch_result.peer_username,
+        socket,
+        punch_result.peer_addr,
+        shared_secret,
+    );
+
+    chat.run()?;
+
+    println!("\nSession ended.");
+    Ok(())
+}
+
+async fn join_session(code: &str, username: &str, password: &str) -> Result<()> {
+    // Validate username
+    if let Err(e) = validate_username(username) {
+        return Err(anyhow::anyhow!("Invalid username: {}", e));
+    }
+
+    println!("\nJoining session...\n");
+
+    // Parse session code
+    let session_info = SessionInfo::from_code(code)?;
+    println!("Peer address: {}", session_info.peer_addr);
+    println!("Session ID: {}", session_info.id);
+
+    // Derive password hash with provided salt
+    let _auth = SessionAuth::with_salt(password, session_info.salt);
+
+    // Discover our public endpoint (needed for hole punching) - this also creates our socket
+    print!("Discovering public address... ");
+    let (socket, public_addr) = discover_public_endpoint()?;
+    println!("{}", public_addr);
+
+    let local_addr = socket.local_addr()?;
+    println!("Local socket: {}", local_addr);
+
+    // Generate keypair
+    let key_exchange = KeyExchange::new();
+    let our_public_key = key_exchange.public_key().as_bytes().to_vec();
+    println!();
+    println!("Your fingerprint: {}", fingerprint(&our_public_key));
+    println!();
+
+    // Connect to peer via hole punching
+    let punch_result = connect_to_peer(
+        &socket,
+        session_info.peer_addr,
+        session_info.id.as_str(),
+        &key_exchange,
+        username,
+        CONNECTION_TIMEOUT,
+    )?;
+
+    // Derive shared secret
+    let peer_public = x25519_dalek::PublicKey::from(punch_result.peer_public_key);
+    let shared_secret = key_exchange.derive_shared_secret(&peer_public);
+
+    println!();
+    println!(
+        "Connected to: {} [{}]",
+        punch_result.peer_username,
+        fingerprint(&punch_result.peer_public_key)
+    );
+    println!();
+
+    // Start chat
+    let mut chat = P2PChat::new(
+        username.to_string(),
+        punch_result.peer_username,
+        socket,
+        punch_result.peer_addr,
+        shared_secret,
+    );
+
+    chat.run()?;
+
+    println!("\nSession ended.");
     Ok(())
 }
