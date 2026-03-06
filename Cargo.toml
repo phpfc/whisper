@@ -2,6 +2,11 @@
 name = "t-chat"
 version = "0.1.0"
 edition = "2021"
+description = "A simple, secure, and private P2P chat CLI with E2E encryption"
+license = "MIT"
+repository = "https://github.com/phpfc/t-chat"
+keywords = ["chat", "p2p", "cli", "encryption", "e2e"]
+categories = ["command-line-utilities", "cryptography", "network-programming"]
 
 [dependencies]
 tokio = { version = "1.42", features = ["full"] }

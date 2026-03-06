@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build Release
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/t-chat
+
+      - name: Create archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf t-chat-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz t-chat
+          shasum -a 256 t-chat-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz > t-chat-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload binaries to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.target }}/release/t-chat-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/t-chat-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          body: |
+            ## Installation
+
+            ### Homebrew (macOS)
+            ```bash
+            brew tap phpfc/t-chat
+            brew install t-chat
+            ```
+
+            ### Manual Installation
+            Download the appropriate binary for your system below and add it to your PATH.
+
+            ## Changes
+            See [CHANGELOG.md](https://github.com/phpfc/t-chat/blob/master/CHANGELOG.md) for details.
+
+  build-bottle:
+    name: Build Homebrew Bottle
+    needs: build-release
+    runs-on: macos-latest
+    steps:
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Clone tap repository
+        run: |
+          git clone https://github.com/phpfc/homebrew-t-chat.git tap-repo
+
+      - name: Download and calculate source tarball SHA256
+        run: |
+          curl -sL "https://github.com/phpfc/t-chat/archive/refs/tags/${{ steps.get_version.outputs.tag }}.tar.gz" -o source.tar.gz
+          echo "SOURCE_SHA=$(shasum -a 256 source.tar.gz | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Update formula source version and SHA256
+        run: |
+          cd tap-repo
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag }}"
+
+          # Update source URL and SHA256
+          sed -i '' "s|url \".*\"|url \"https://github.com/phpfc/t-chat/archive/refs/tags/${TAG}.tar.gz\"|" Formula/t-chat.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"${SOURCE_SHA}\"|" Formula/t-chat.rb
+
+          # Update test assertion to match new version (non-greedy match)
+          sed -i '' "s|assert_match \"t-chat [^\"]*\"|assert_match \"t-chat\"|" Formula/t-chat.rb
+
+      - name: Commit and push formula source update
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/t-chat.rb
+          git commit -m "Update t-chat source to v${{ steps.get_version.outputs.version }}"
+          git push https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/phpfc/homebrew-t-chat.git main
+
+      - name: Tap and install formula
+        run: |
+          brew tap phpfc/t-chat
+          brew install --build-bottle t-chat
+
+      - name: Build bottle
+        id: bottle
+        run: |
+          brew bottle --json t-chat
+          BOTTLE_FILE=$(ls t-chat--*.bottle.*.tar.gz 2>/dev/null || ls ./t-chat--*.bottle.*.tar.gz)
+          BOTTLE_JSON=$(ls t-chat--*.bottle.json 2>/dev/null || ls ./t-chat--*.bottle.json)
+
+          # Rename bottle file from double-dash to single-dash (Homebrew naming convention)
+          RENAMED_BOTTLE=$(echo "${BOTTLE_FILE}" | sed 's/t-chat--/t-chat-/')
+          mv "${BOTTLE_FILE}" "${RENAMED_BOTTLE}"
+
+          echo "bottle_file=${RENAMED_BOTTLE}" >> $GITHUB_OUTPUT
+          echo "bottle_json=${BOTTLE_JSON}" >> $GITHUB_OUTPUT
+          echo "Original bottle file: ${BOTTLE_FILE}"
+          echo "Renamed bottle file: ${RENAMED_BOTTLE}"
+          echo "Bottle JSON: ${BOTTLE_JSON}"
+
+      - name: Upload bottle to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ steps.bottle.outputs.bottle_file }}
+
+      - name: Pull latest formula changes
+        run: |
+          cd tap-repo
+          git pull
+
+      - name: Update formula with bottle info
+        run: |
+          cd tap-repo
+
+          # Extract bottle info from JSON
+          BOTTLE_SHA=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.tags | to_entries[0].value.sha256')
+          BOTTLE_TAG=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.tags | to_entries[0].key')
+          BOTTLE_REBUILD=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.rebuild')
+          TAG="${{ steps.get_version.outputs.tag }}"
+
+          echo "Bottle SHA: ${BOTTLE_SHA}"
+          echo "Bottle OS tag: ${BOTTLE_TAG}"
+          echo "Bottle rebuild: ${BOTTLE_REBUILD}"
+
+          # Update bottle root_url
+          sed -i '' "s|root_url \".*\"|root_url \"https://github.com/phpfc/t-chat/releases/download/${TAG}\"|" Formula/t-chat.rb
+
+          # Update bottle rebuild number
+          sed -i '' "s|rebuild .*|rebuild ${BOTTLE_REBUILD}|" Formula/t-chat.rb
+
+          # Update bottle SHA256 with correct OS tag
+          sed -i '' "s|sha256 cellar: :any_skip_relocation, .*: \".*\"|sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"|" Formula/t-chat.rb
+
+      - name: Commit and push formula bottle update
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/t-chat.rb
+          git commit -m "Update t-chat to v${{ steps.get_version.outputs.version }}"
+          git push https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/phpfc/homebrew-t-chat.git main
