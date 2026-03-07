@@ -1,227 +1,111 @@
-# t-chat
+# Whisper
 
-Uma ferramenta CLI de chat simples, segura e privada construída em Rust.
+Secure P2P terminal chat. Zero config, no servers needed.
 
-## Características
+## Features
 
-- **🔐 Criptografia End-to-End**: Todas as mensagens são criptografadas usando ChaCha20-Poly1305
-- **⚡ Efêmero**: Mensagens não são armazenadas, apenas transmitidas em tempo real
-- **🔑 Autenticação**: Proteção de sessões com senha (SHA-256)
-- **🌐 Zero Configuração**: Não precisa mexer em roteador ou hospedar servidor
-- **🚀 Relay Público**: Conecta automaticamente em servidores relay da comunidade
+- **True P2P**: Direct connection via UDP hole punching - no relay servers
+- **E2E Encrypted**: X25519 key exchange + ChaCha20-Poly1305
+- **Zero Config**: No router setup, no server deployment, just run it
+- **Ephemeral**: Messages exist only in transit, never stored
 
-## Instalação
+## Installation
 
 ### Homebrew (macOS)
 ```bash
-brew tap phpfc/t-chat
-brew install t-chat
+brew tap phpfc/whisper
+brew install whisper
 ```
 
-### Via Cargo
+### Windows
+Download from [Releases](https://github.com/phpfc/whisper/releases), extract, and run:
+```powershell
+# Or via PowerShell:
+Invoke-WebRequest -Uri "https://github.com/phpfc/whisper/releases/latest/download/whisper-x86_64-pc-windows-msvc.zip" -OutFile whisper.zip
+Expand-Archive whisper.zip -DestinationPath .
+.\whisper.exe --help
+```
+
+### Build from Source
 ```bash
-cargo install --git https://github.com/phpfc/t-chat
+cargo install --git https://github.com/phpfc/whisper
 ```
 
-### Build Manual
+## Usage
+
+### Create a session
 ```bash
-git clone https://github.com/phpfc/t-chat
-cd t-chat
-cargo build --release
+whisper create -u alice -p mysecret
 ```
 
-O binário será criado em `target/release/t-chat`
+Output:
+```
+Discovering public endpoint via STUN...
+Your endpoint: 203.45.67.89:54321
 
-## Uso Super Simples
+Share this session code with your peer:
+203.45.67.89:54321#7kJ9xnYpQm#QgT98sXCthe3
 
-**Zero configuração. Zero servidores. Apenas 2 comandos.**
+Waiting for peer to connect...
+```
 
+### Join a session
 ```bash
-# Terminal 1 - Alice cria sessão
-./t-chat create --username Alice --password minhasenha
-# 🚀 Creating new session...
-# 💡 Starting embedded relay server...
-# ✓ Relay running on 127.0.0.1:8080
-# 📋 Session ID: abc-123-def
-# 📤 Share this ID with others to let them join!
-
-# Terminal 2 - Bob entra (conecta no relay de Alice)
-./t-chat join --session abc-123-def --username Bob --password minhasenha
+whisper join "203.45.67.89:54321#7kJ9xnYpQm#QgT98sXCthe3" -u bob -p mysecret
 ```
 
-**Pronto!** Vocês estão conversando com criptografia E2E.
+That's it. You're chatting with E2E encryption.
 
-### Como funciona:
-
-1. **Alice cria sessão** → Automaticamente vira relay para a sessão
-2. **Bob conecta** → Usa o relay embutido de Alice
-3. **Zero servidor externo** → Tudo roda nos processos dos usuários
-4. **E2E Criptografado** → Mesmo Alice (relay) não vê as mensagens
-
----
-
-## Como Funciona Internamente?
-
-### Modo Automático (Padrão):
-
-1. **Alice executa `create`**
-   - Busca relays públicos disponíveis
-   - Se encontrar → usa relay público
-   - Se NÃO encontrar → **inicia relay embutido automaticamente**
-
-2. **Bob executa `join`**
-   - Conecta no relay (público ou de Alice)
-   - Troca chaves E2E com Alice
-   - Começa a conversar
-
-### Arquitetura:
+## How It Works
 
 ```
-┌─────────────────────────────────────────────┐
-│  Alice's Process                            │
-│  ┌──────────────┐    ┌──────────────┐      │
-│  │ Chat Client  │◄──►│ Relay Server │      │
-│  │  (Alice)     │    │  (embedded)  │      │
-│  └──────────────┘    └───────┬──────┘      │
-└─────────────────────────────┼──────────────┘
-                              │
-                              │ TCP
-                              │
-                    ┌─────────▼──────────┐
-                    │   Bob's Process    │
-                    │  ┌──────────────┐  │
-                    │  │ Chat Client  │  │
-                    │  │    (Bob)     │  │
-                    │  └──────────────┘  │
-                    └────────────────────┘
+┌─────────┐                              ┌─────────┐
+│  Alice  │                              │   Bob   │
+└────┬────┘                              └────┬────┘
+     │ 1. STUN query                          │
+     ▼                                        ▼
+┌─────────┐                              ┌─────────┐
+│ Google  │                              │ Google  │
+│  STUN   │                              │  STUN   │
+└─────────┘                              └─────────┘
+     │ 2. Get public IP:port                  │
+     ▼                                        ▼
+┌─────────┐  3. Share code out-of-band   ┌─────────┐
+│  Alice  │ ◄──────────────────────────► │   Bob   │
+└────┬────┘                              └────┬────┘
+     │                                        │
+     │  4. UDP hole punch + key exchange      │
+     │◄══════════════════════════════════════►│
+     │       5. Encrypted P2P chat            │
+     └────────────────────────────────────────┘
 ```
 
-### Segurança:
+1. Both peers query STUN servers to discover their public IP:port
+2. Alice generates a session code containing her endpoint + session ID + salt
+3. Bob receives the code (via any channel - SMS, email, etc.)
+4. Both send UDP packets to punch through NAT, then exchange X25519 keys
+5. Direct encrypted chat begins
 
-- ✅ **E2E Criptografado**: ChaCha20-Poly1305
-- ✅ **Relay cego**: Não pode descriptografar mensagens
-- ✅ **Zero logs**: Mensagens apenas retransmitidas, nunca armazenadas
-- ✅ **Senha protegida**: Hash SHA-256
+## Security
 
----
+| Component | Implementation |
+|-----------|---------------|
+| Key Exchange | X25519 ECDH |
+| Encryption | ChaCha20-Poly1305 |
+| Password KDF | Argon2id |
+| Nonce | Counter-based (no collision) |
 
-## Relays Públicos (Opcional)
+**What STUN servers see**: Your public IP (required for NAT traversal)
+**What STUN servers DON'T see**: Session codes, messages, passwords, keys
 
-Para melhor performance ou uso em produção, a comunidade pode hospedar relays públicos.
+## Limitations
 
-Ver: [RELAYS.md](RELAYS.md) para detalhes.
+- **Symmetric NAT**: ~15-20% of corporate/carrier-grade NAT won't work. The connection will fail explicitly.
+- **Both online**: Unlike relay-based chat, both peers must be online simultaneously.
+- **1-to-1 only**: Currently supports two participants per session.
 
-**Mas não é necessário!** O app funciona perfeitamente sem relays externos.
+These are architectural tradeoffs for true P2P with zero infrastructure.
 
-## Exemplo Completo
-
-```bash
-# Terminal 1 - Alice cria e vira relay automaticamente
-./t-chat create --username Alice --password senha123
-# 🚀 Creating new session...
-# 🔍 Looking for public relays... None found.
-# 💡 Starting embedded relay server...
-# ✓ Relay running on 127.0.0.1:8080
-# 📋 Session ID: abc-123-def
-# 📤 Share this ID with others to let them join!
-
-# Terminal 2 - Bob conecta
-./t-chat join --session abc-123-def --username Bob --password senha123
-# 🔍 Searching for available relays...
-#   Trying 127.0.0.1:8080... ✓ Online
-# 📥 Joining session abc-123-def...
-# [Interface de chat abre]
-
-# Agora conversem! Digite e pressione Enter. ESC para sair.
-```
-
-### Comandos Disponíveis:
-
-```bash
-# Criar sessão (auto-relay)
-./t-chat create --username Alice --password senha
-
-# Entrar em sessão
-./t-chat join --session <ID> --username Bob --password senha
-
-# Rodar apenas relay (opcional)
-./t-chat server
-
-# Usar relay específico
-./t-chat create --username Alice --password senha --server IP:PORTA
-./t-chat join --session <ID> --username Bob --password senha --server IP:PORTA
-```
-
-## Interface de Chat
-
-- Digite sua mensagem e pressione `Enter` para enviar
-- Pressione `Esc` para sair
-- O título mostra o Session ID e seu username
-- Mensagens aparecem em tempo real
-
-## Arquitetura de Segurança
-
-### Criptografia E2E
-
-1. **Troca de Chaves**: Quando usuários se conectam, trocam chaves públicas X25519
-2. **Derivação de Segredo**: Cada par de usuários deriva um segredo compartilhado via ECDH
-3. **Criptografia**: Mensagens são criptografadas com ChaCha20-Poly1305
-4. **Autenticação**: Sessões protegidas com hash SHA-256 da senha
-
-### Modo Relay - O que o servidor vê/não vê
-
-| O servidor PODE ver | O servidor NÃO PODE ver |
-|---------------------|-------------------------|
-| IDs de sessão | Senha original |
-| Usernames | Conteúdo das mensagens |
-| Chaves públicas | Segredos compartilhados |
-| Mensagens criptografadas | Texto plano |
-| IPs e horários de conexão | Chaves privadas |
-
-### Modo P2P - Maximamente Privado
-
-- **STUN público** vê apenas: seu IP público e porta (necessário para NAT traversal)
-- **Nenhum servidor central** processa seus dados
-- **Conexão direta** entre peers
-- **Ninguém pode** interceptar mensagens em texto plano
-
-## Limitações e Requisitos
-
-### Modo Relay
-- Requer servidor acessível por todos os participantes
-- Sessões não persistem após o servidor reiniciar
-
-### Modo P2P
-- ⚠️ **NAT Simétrico**: Pode falhar em ~20% dos casos (redes corporativas/móveis)
-- Requer STUN servers públicos acessíveis (Google STUN)
-- **Nota**: Modo P2P com chat completo será implementado em breve. Atualmente o comando gera o convite e exibe instruções.
-
-### Ambos os Modos
-- Interface suporta chat em grupo (todos veem todas as mensagens)
-- Máximo 2 pessoas por sessão atualmente (1-to-1)
-
-## Melhorias Futuras
-
-- [ ] Suporte a múltiplas salas por sessão
-- [ ] Mensagens diretas 1-to-1
-- [ ] Histórico de mensagens criptografado localmente
-- [ ] Descoberta de peers na rede local (mDNS)
-- [ ] Suporte a arquivos/imagens
-- [ ] Verificação de identidade (fingerprints)
-
-## Tecnologias Utilizadas
-
-- **Rust**: Linguagem de programação
-- **Tokio**: Runtime assíncrono
-- **Clap**: Parsing de argumentos CLI
-- **Ratatui + Crossterm**: Interface de usuário no terminal
-- **Ring + X25519-Dalek**: Criptografia
-- **Serde**: Serialização de dados
-
-## Licença
+## License
 
 MIT
-
-## Contribuindo
-
-Pull requests são bem-vindos! Para mudanças grandes, por favor abra uma issue primeiro.
