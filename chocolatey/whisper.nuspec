@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
-    <id>t-chat</id>
+    <id>whisper</id>
     <version>0.1.0</version>
-    <title>t-chat</title>
+    <title>whisper</title>
     <authors>phpfc</authors>
     <owners>phpfc</owners>
-    <projectUrl>https://github.com/phpfc/t-chat</projectUrl>
-    <licenseUrl>https://github.com/phpfc/t-chat/blob/main/LICENSE</licenseUrl>
+    <projectUrl>https://github.com/phpfc/whisper</projectUrl>
+    <licenseUrl>https://github.com/phpfc/whisper/blob/main/LICENSE</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <projectSourceUrl>https://github.com/phpfc/t-chat</projectSourceUrl>
-    <bugTrackerUrl>https://github.com/phpfc/t-chat/issues</bugTrackerUrl>
+    <projectSourceUrl>https://github.com/phpfc/whisper</projectSourceUrl>
+    <bugTrackerUrl>https://github.com/phpfc/whisper/issues</bugTrackerUrl>
     <tags>chat p2p cli encryption e2e terminal secure</tags>
     <summary>Secure P2P chat in the terminal</summary>
     <description>
-t-chat is a secure peer-to-peer chat application for the terminal.
+whisper is a secure peer-to-peer chat application for the terminal.
 
 ## Features
 - Zero configuration - no servers to deploy
@@ -24,11 +24,11 @@ t-chat is a secure peer-to-peer chat application for the terminal.
 
 ## Usage
 ```
-t-chat create -u yourname -p password    # Create a session
-t-chat join SESSION_CODE -u name -p pass # Join a session
+whisper create -u yourname -p password    # Create a session
+whisper join SESSION_CODE -u name -p pass # Join a session
 ```
     </description>
-    <releaseNotes>https://github.com/phpfc/t-chat/releases/tag/v0.1.0</releaseNotes>
+    <releaseNotes>https://github.com/phpfc/whisper/releases/tag/v0.1.0</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

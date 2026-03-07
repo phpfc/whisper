@@ -5,55 +5,171 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest
+  build-release:
+    name: Build Release
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
           - target: x86_64-unknown-linux-gnu
-          - target: x86_64-pc-windows-gnu
-
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-action@stable
-      - name: Install cross
-        run: cargo install cross
-      - name: Build
-        run: cross build --release --target x86_64-unknown-linux-gnu
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: t-chat-linux
-          path: target/x86_64-unknown-linux-gnu/release/t-chat
 
-  build-macos:
-    name: Build macOS
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: strip target/${{ matrix.target }}/release/whisper
+
+      - name: Create archive (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz whisper
+          shasum -a 256 whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz > whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Create archive (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path whisper.exe -DestinationPath whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip
+          $hash = (Get-FileHash -Algorithm SHA256 whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip).Hash.ToLower()
+          "$hash  whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip" | Out-File -Encoding ASCII whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip.sha256
+
+      - name: Upload binaries to release (Unix)
+        if: matrix.os != 'windows-latest'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.target }}/release/whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload binaries to release (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.target }}/release/whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip
+            target/${{ matrix.target }}/release/whisper-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip.sha256
+
+  build-bottle:
+    name: Build Homebrew Bottle
+    needs: build-release
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --release
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: t-chat-macos
-          path: target/release/t-chat
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
 
-  build-windows:
-    name: Build Windows
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --release
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - name: Get version from tag
+        id: get_version
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Clone tap repository
+        run: |
+          git clone https://github.com/phpfc/homebrew-whisper.git tap-repo
+
+      - name: Download and calculate source tarball SHA256
+        run: |
+          curl -sL "https://github.com/phpfc/whisper/archive/refs/tags/${{ steps.get_version.outputs.tag }}.tar.gz" -o source.tar.gz
+          echo "SOURCE_SHA=$(shasum -a 256 source.tar.gz | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Update formula source version and SHA256
+        run: |
+          cd tap-repo
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag }}"
+
+          sed -i '' "s|url \".*\"|url \"https://github.com/phpfc/whisper/archive/refs/tags/${TAG}.tar.gz\"|" Formula/whisper.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"${SOURCE_SHA}\"|" Formula/whisper.rb
+          sed -i '' "s|assert_match \"whisper [^\"]*\"|assert_match \"whisper ${VERSION}\"|" Formula/whisper.rb
+
+      - name: Commit and push formula source update
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/whisper.rb
+          git commit -m "Update whisper source to v${{ steps.get_version.outputs.version }}" || true
+          git push https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/phpfc/homebrew-whisper.git main || true
+
+      - name: Tap and install formula
+        run: |
+          brew tap phpfc/whisper
+          brew install --build-bottle whisper
+
+      - name: Build bottle
+        id: bottle
+        run: |
+          brew bottle --json whisper
+          BOTTLE_FILE=$(ls whisper--*.bottle.*.tar.gz 2>/dev/null || ls ./whisper--*.bottle.*.tar.gz)
+          BOTTLE_JSON=$(ls whisper--*.bottle.json 2>/dev/null || ls ./whisper--*.bottle.json)
+
+          RENAMED_BOTTLE=$(echo "${BOTTLE_FILE}" | sed 's/whisper--/whisper-/')
+          mv "${BOTTLE_FILE}" "${RENAMED_BOTTLE}"
+
+          echo "bottle_file=${RENAMED_BOTTLE}" >> $GITHUB_OUTPUT
+          echo "bottle_json=${BOTTLE_JSON}" >> $GITHUB_OUTPUT
+
+      - name: Upload bottle to release
+        uses: softprops/action-gh-release@v1
         with:
-          name: t-chat-windows
-          path: target/release/t-chat.exe
+          files: ${{ steps.bottle.outputs.bottle_file }}
+
+      - name: Pull latest formula changes
+        run: |
+          cd tap-repo
+          git pull
+
+      - name: Update formula with bottle info
+        run: |
+          cd tap-repo
+
+          BOTTLE_SHA=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.tags | to_entries[0].value.sha256')
+          BOTTLE_TAG=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.tags | to_entries[0].key')
+          BOTTLE_REBUILD=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.rebuild')
+          TAG="${{ steps.get_version.outputs.tag }}"
+
+          sed -i '' "s|root_url \".*\"|root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"|" Formula/whisper.rb
+          sed -i '' "s|rebuild .*|rebuild ${BOTTLE_REBUILD}|" Formula/whisper.rb
+          sed -i '' "s|sha256 cellar: :any_skip_relocation, .*: \".*\"|sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"|" Formula/whisper.rb
+
+      - name: Commit and push formula bottle update
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/whisper.rb
+          git commit -m "Update whisper bottle to v${{ steps.get_version.outputs.version }}"
+          git push https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/phpfc/homebrew-whisper.git main

@@ -17,7 +17,7 @@ use stun::discover_public_endpoint;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
-#[command(name = "t-chat")]
+#[command(name = "whisper")]
 #[command(about = "Secure P2P chat in the terminal. Zero configuration, no servers needed.")]
 #[command(version)]
 struct Cli {

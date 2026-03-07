@@ -1,11 +1,11 @@
 $ErrorActionPreference = 'Stop'
 
-$packageName = 't-chat'
+$packageName = 'whisper'
 $toolsDir = "$(Split-Path -parent $MyInvocation.MyCommand.Definition)"
 
 # Version and URLs
 $version = '0.1.0'
-$url64 = "https://github.com/phpfc/t-chat/releases/download/v$version/t-chat-x86_64-pc-windows-msvc.zip"
+$url64 = "https://github.com/phpfc/whisper/releases/download/v$version/whisper-x86_64-pc-windows-msvc.zip"
 
 # Checksum (update after building release)
 $checksum64 = 'PLACEHOLDER_SHA256'
