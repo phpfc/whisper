@@ -170,22 +170,15 @@ jobs:
           echo "Bottle OS tag: ${BOTTLE_TAG}"
           echo "Bottle rebuild: ${BOTTLE_REBUILD}"
 
-          # Check if bottle block exists
-          if grep -q "bottle do" Formula/whisper.rb; then
+          # Check if bottle block exists, if not insert it
+          if ! grep -q "bottle do" Formula/whisper.rb; then
+            # Insert bottle block after head line using perl (more reliable than sed for multiline)
+            perl -i -pe "s|(^  head .*)|\$1\n\n  bottle do\n    root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"\n    rebuild ${BOTTLE_REBUILD}\n    sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"\n  end|" Formula/whisper.rb
+          else
             # Update existing bottle block
             sed -i '' "s|root_url \".*\"|root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"|" Formula/whisper.rb
             sed -i '' "s|rebuild .*|rebuild ${BOTTLE_REBUILD}|" Formula/whisper.rb
             sed -i '' "s|sha256 cellar: :any_skip_relocation, .*: \".*\"|sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"|" Formula/whisper.rb
-          else
-            # Insert bottle block after head line
-            sed -i '' "/^  head /a\\
-\\
-  bottle do\\
-    root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"\\
-    rebuild ${BOTTLE_REBUILD}\\
-    sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"\\
-  end
-" Formula/whisper.rb
           fi
 
           cat Formula/whisper.rb
