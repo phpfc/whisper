@@ -18,12 +18,13 @@ brew install whisper
 ```
 
 ### Windows
-Download from [Releases](https://github.com/phpfc/whisper/releases), extract, and run:
+Download from [Releases](https://github.com/phpfc/whisper/releases), extract, and run `whisper.exe`.
+
+Or via PowerShell:
 ```powershell
-# Or via PowerShell:
-Invoke-WebRequest -Uri "https://github.com/phpfc/whisper/releases/latest/download/whisper-x86_64-pc-windows-msvc.zip" -OutFile whisper.zip
-Expand-Archive whisper.zip -DestinationPath .
-.\whisper.exe --help
+Invoke-WebRequest -Uri "https://github.com/phpfc/whisper/releases/download/v0.2.1/whisper-0.2.1-x86_64-pc-windows-msvc.zip" -OutFile whisper.zip
+Expand-Archive whisper.zip -DestinationPath C:\whisper
+C:\whisper\whisper.exe --help
 ```
 
 ### Build from Source
