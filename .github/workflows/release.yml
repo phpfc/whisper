@@ -107,9 +107,11 @@ jobs:
           VERSION="${{ steps.get_version.outputs.version }}"
           TAG="${{ steps.get_version.outputs.tag }}"
 
-          # Update source URL and SHA256 (same approach as cleanser)
-          sed -i '' "s|url \".*\"|url \"https://github.com/phpfc/whisper/archive/refs/tags/${TAG}.tar.gz\"|" Formula/whisper.rb
-          sed -i '' "s|sha256 \".*\"|sha256 \"${SOURCE_SHA}\"|" Formula/whisper.rb
+          # Update source URL (only matches '  url', not 'root_url')
+          sed -i '' "s|^  url \".*\"|  url \"https://github.com/phpfc/whisper/archive/refs/tags/${TAG}.tar.gz\"|" Formula/whisper.rb
+
+          # Update source SHA256 (only the one right after url, before 'license')
+          sed -i '' "s|^  sha256 \".*\"|  sha256 \"${SOURCE_SHA}\"|" Formula/whisper.rb
 
           # Update test assertion to match new version
           sed -i '' "s|assert_match \"whisper [^\"]*\"|assert_match \"whisper ${VERSION}\"|" Formula/whisper.rb
@@ -164,9 +166,29 @@ jobs:
           BOTTLE_REBUILD=$(cat ../${{ steps.bottle.outputs.bottle_json }} | jq -r '.[] | .bottle.rebuild')
           TAG="${{ steps.get_version.outputs.tag }}"
 
-          sed -i '' "s|root_url \".*\"|root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"|" Formula/whisper.rb
-          sed -i '' "s|rebuild .*|rebuild ${BOTTLE_REBUILD}|" Formula/whisper.rb
-          sed -i '' "s|sha256 cellar: :any_skip_relocation, .*: \".*\"|sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"|" Formula/whisper.rb
+          echo "Bottle SHA: ${BOTTLE_SHA}"
+          echo "Bottle OS tag: ${BOTTLE_TAG}"
+          echo "Bottle rebuild: ${BOTTLE_REBUILD}"
+
+          # Check if bottle block exists
+          if grep -q "bottle do" Formula/whisper.rb; then
+            # Update existing bottle block
+            sed -i '' "s|root_url \".*\"|root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"|" Formula/whisper.rb
+            sed -i '' "s|rebuild .*|rebuild ${BOTTLE_REBUILD}|" Formula/whisper.rb
+            sed -i '' "s|sha256 cellar: :any_skip_relocation, .*: \".*\"|sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"|" Formula/whisper.rb
+          else
+            # Insert bottle block after head line
+            sed -i '' "/^  head /a\\
+\\
+  bottle do\\
+    root_url \"https://github.com/phpfc/whisper/releases/download/${TAG}\"\\
+    rebuild ${BOTTLE_REBUILD}\\
+    sha256 cellar: :any_skip_relocation, ${BOTTLE_TAG}: \"${BOTTLE_SHA}\"\\
+  end
+" Formula/whisper.rb
+          fi
+
+          cat Formula/whisper.rb
 
       - name: Commit and push formula bottle update
         env:
