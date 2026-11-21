@@ -11,11 +11,13 @@ mod portmap;
 mod session;
 mod signal;
 mod stun;
+mod util;
 mod wire;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mainline::async_dht::AsyncDht;
 use tokio::sync::mpsc;
@@ -36,6 +38,16 @@ use signal::{public_dht, spawn, Signaling};
 const SIGNAL_POLL: Duration = Duration::from_secs(3);
 
 const DHT_UNAVAILABLE: &str = "DHT unavailable; only direct connections will work.";
+
+/// Test hooks, read from the environment only (there is no CLI flag for them).
+/// The NAT lab drives two peers with these, plus `WHISPER_STUN_SERVERS` and
+/// `WHISPER_DHT_BOOTSTRAP`.
+///
+/// `=1`: once connected, print `CONNECTED via {path}` and exit 0 instead of
+/// opening the chat. A failure to connect still exits non-zero.
+const EXIT_ON_CONNECT_ENV: &str = "WHISPER_TEST_EXIT_ON_CONNECT";
+/// The session creator writes its code to this file.
+const CODE_FILE_ENV: &str = "WHISPER_TEST_CODE_FILE";
 
 const NO_DHT_NO_ADDRESS: &str = "The DHT is unreachable and this code has no direct address, so the other peer cannot be found. Check that this network allows UDP traffic.";
 
@@ -112,6 +124,25 @@ async fn main() -> Result<()> {
 /// An empty password is the same as none: both derive the same key.
 fn non_empty(password: &Option<String>) -> Option<&str> {
     password.as_deref().filter(|p| !p.is_empty())
+}
+
+fn exit_on_connect() -> bool {
+    std::env::var(EXIT_ON_CONNECT_ENV).is_ok_and(|v| v == "1")
+}
+
+/// Writes `code` and a newline to `path`. The file shows up complete: it is
+/// written next to `path` and renamed, so a script polling for it never reads
+/// half a code.
+fn write_code_file(path: &Path, code: &str) -> Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let written = std::fs::write(&temp, format!("{code}\n"))
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written.with_context(|| format!("could not write the session code to {}", path.display()))
 }
 
 fn check_username(username: &str) -> Result<()> {
@@ -201,11 +232,12 @@ async fn create_session(username: &str, password: Option<&str>, cancel: &Cancel)
         direct: select_direct(&gathered.candidates),
     };
 
+    let encoded = code.encode();
     println!();
     println!("========================================");
     println!("SESSION CODE:");
     println!();
-    println!("  {}", code.encode());
+    println!("  {encoded}");
     println!();
     println!("Share this code with your peer.");
     if password.is_some() {
@@ -213,6 +245,13 @@ async fn create_session(username: &str, password: Option<&str>, cancel: &Cancel)
     }
     println!("========================================");
     println!();
+
+    if let Some(path) = std::env::var_os(CODE_FILE_ENV) {
+        if let Err(e) = write_code_file(Path::new(&path), &encoded) {
+            close_portmap(gathered.portmap.take()).await;
+            return Err(e);
+        }
+    }
 
     // After the code is out: the publish happens in the background and must
     // not hold it back.
@@ -339,7 +378,12 @@ async fn run_session(
                 "Session fingerprint: {} (should match your peer's)",
                 conn.fingerprint
             );
-            run_chat(username, conn).await
+            if exit_on_connect() {
+                println!("CONNECTED via {}", conn.path);
+                Ok(())
+            } else {
+                run_chat(username, conn).await
+            }
         }
         Err(ConnectError::NoPath { remote }) => {
             Err(anyhow!(doctor::explain_no_path(&summary, remote.as_ref())))
@@ -376,6 +420,22 @@ mod tests {
             secret: SessionSecret([1; 16]),
             direct: direct.iter().map(|a| a.parse().unwrap()).collect(),
         }
+    }
+
+    #[test]
+    fn code_file_holds_the_code_and_leaves_nothing_else_behind() {
+        let dir = std::env::temp_dir().join(format!("whisper-code-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("code");
+
+        write_code_file(&path, "first").unwrap();
+        write_code_file(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // A directory that does not exist is an error, not a silent skip.
+        assert!(write_code_file(&dir.join("missing").join("code"), "x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::crypto::{initiator, responder, Transport};
 use crate::gather::{NetSummary, Sockets};
 use crate::keys::SessionKeys;
 use crate::session::validate_username;
+use crate::util::is_transient;
 use crate::wire::{probe, probe_ack, verify, ChatPayload, Packet, MAX_DATAGRAM};
 
 /// Probe transaction ids, ours waiting for a `ProbeAck` and the peer's already
@@ -53,12 +54,6 @@ const FINAL_PINGS: usize = 3;
 /// A joiner suspects the creator's record is stale once it is older than the
 /// creator's wait plus this: the creator has probably given up by then.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
-
-/// Windows fails a receive with WSAEMSGSIZE when the datagram is larger than
-/// the buffer (other systems truncate it), and with WSAENETRESET when an ICMP
-/// "TTL expired" arrives for an earlier send.
-const WSAEMSGSIZE: i32 = 10040;
-const WSAENETRESET: i32 = 10052;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -682,22 +677,6 @@ fn best_path(confirmed: &[SocketAddr], remote: &[Candidate]) -> Option<Candidate
         .copied()
 }
 
-/// Receive errors about a single datagram or an ICMP report for an earlier
-/// send, not about the socket. Windows reports the port-unreachable caused by
-/// probing a dead candidate as `ConnectionReset` on the next `recv_from`.
-fn is_transient(e: &io::Error) -> bool {
-    use io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        ConnectionReset
-            | ConnectionRefused
-            | HostUnreachable
-            | NetworkUnreachable
-            | Interrupted
-            | WouldBlock
-    ) || (cfg!(windows) && matches!(e.raw_os_error(), Some(WSAEMSGSIZE | WSAENETRESET)))
-}
-
 fn socket_for(sockets: &Sockets, to: SocketAddr) -> Option<&UdpSocket> {
     match to {
         SocketAddr::V4(_) => Some(&sockets.v4),
@@ -1292,14 +1271,6 @@ mod tests {
         assert_eq!(learned(&checks), 4);
         assert!(checks.confirmed.is_empty());
         assert!(checks.tiebreak_at.is_none());
-    }
-
-    #[test]
-    fn per_datagram_receive_errors_are_not_fatal() {
-        use io::ErrorKind::*;
-        assert!(is_transient(&ConnectionReset.into()));
-        assert!(is_transient(&ConnectionRefused.into()));
-        assert!(!is_transient(&InvalidInput.into()));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::connect::{PeerInfo, Role};
 use crate::keys::SessionKeys;
+use crate::util::list_from_env;
 
 /// Salt of the item the creator publishes.
 pub const SALT_CREATOR: &[u8] = b"c";
@@ -38,9 +39,25 @@ const PUBLISH_RETRY: Duration = Duration::from_secs(5);
 const PUBLISH_WARNING: &str =
     "Warning: could not publish to the DHT; the other peer can only reach you directly.";
 
-/// Starts a DHT client node that bootstraps from the default public nodes.
+/// Environment variable that replaces the default bootstrap nodes: a
+/// comma-separated list of `host:port`. Meant for tests and the NAT lab, where
+/// the public nodes are out of reach.
+pub const DHT_BOOTSTRAP_ENV: &str = "WHISPER_DHT_BOOTSTRAP";
+
+/// Starts a DHT client node that bootstraps from the nodes in
+/// `WHISPER_DHT_BOOTSTRAP` if it names any, else from the default public ones.
 pub fn public_dht() -> std::io::Result<AsyncDht> {
-    Ok(mainline::Dht::client()?.as_async())
+    dht_node(list_from_env(DHT_BOOTSTRAP_ENV).as_deref())
+}
+
+/// A DHT client node that bootstraps from `bootstrap`, or from the default
+/// public nodes when that is `None`.
+fn dht_node(bootstrap: Option<&[String]>) -> std::io::Result<AsyncDht> {
+    let mut builder = mainline::Dht::builder();
+    if let Some(nodes) = bootstrap {
+        builder.bootstrap(nodes);
+    }
+    Ok(builder.build()?.as_async())
 }
 
 fn salt(role: Role) -> &'static [u8] {
@@ -346,6 +363,21 @@ mod tests {
         a.publish(Role::Creator, &info(2)).await.unwrap();
         assert_eq!(b.fetch(Role::Creator).await, Some(info(2)));
         assert_eq!(b.fetch(Role::Joiner).await, None);
+    }
+
+    #[tokio::test]
+    async fn dht_node_bootstraps_from_the_given_list_only() {
+        let testnet = mainline::Testnet::builder(5).build().unwrap();
+        let node = dht_node(Some(&testnet.bootstrap)).unwrap();
+        assert!(node.bootstrapped().await);
+        // Everything it learned of is on the private network: none of the
+        // default public nodes was asked.
+        let known = node.to_bootstrap().await;
+        assert!(!known.is_empty());
+        assert!(
+            known.iter().all(|n| n.starts_with("127.0.0.1:")),
+            "{known:?}"
+        );
     }
 
     #[tokio::test]

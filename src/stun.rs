@@ -1,21 +1,27 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
-/// Public STUN servers - free, reliable, always available
+use crate::util::{is_transient, list_from_env};
+
+/// Environment variable that replaces [`STUN_SERVERS`]: a comma-separated list
+/// of `host:port`. Meant for tests and the NAT lab, where nothing reaches the
+/// public servers.
+pub const STUN_SERVERS_ENV: &str = "WHISPER_STUN_SERVERS";
+
+/// Public STUN servers - free, reliable, always available.
+///
+/// The first two come from different operators: `probe_nat` asks them to tell
+/// whether the NAT keeps the same external mapping regardless of destination.
 pub const STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
     "stun1.l.google.com:19302",
     "stun2.l.google.com:19302",
     "stun3.l.google.com:19302",
     "stun4.l.google.com:19302",
-    "stun.cloudflare.com:3478",
 ];
-
-/// The two servers (from different operators) used to tell whether the NAT
-/// reuses the same external mapping regardless of destination.
-const PROBE_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 
 /// How long `probe_nat` waits for each server.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,6 +50,32 @@ pub fn build_binding_request(txid: &[u8; 12]) -> [u8; 20] {
     // Transaction ID (96 bits)
     request[8..20].copy_from_slice(txid);
     request
+}
+
+/// Builds a Binding Response (0x0101) for the given transaction id, carrying
+/// one XOR-MAPPED-ADDRESS attribute (0x0020) for `addr`: the address the
+/// server saw the request come from.
+// The app only parses responses; this is for the tests and the
+// `stun_responder` example, which includes this file.
+#[allow(dead_code)]
+pub fn build_binding_response(txid: &[u8; 12], addr: SocketAddrV4) -> Vec<u8> {
+    const COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+    let mut response = Vec::with_capacity(32);
+    // Message Type: Binding Response (0x0101)
+    response.extend_from_slice(&[0x01, 0x01]);
+    // Message Length: one attribute = 4-byte header + 8-byte value
+    response.extend_from_slice(&[0x00, 12]);
+    response.extend_from_slice(&COOKIE);
+    response.extend_from_slice(txid);
+    // XOR-MAPPED-ADDRESS: reserved byte, family (IPv4), then the port XORed
+    // with the top half of the cookie and the address XORed with all of it.
+    response.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+    response.extend_from_slice(&[0x00, 0x01]);
+    response.extend_from_slice(&(addr.port() ^ 0x2112).to_be_bytes());
+    for (octet, key) in addr.ip().octets().iter().zip(COOKIE) {
+        response.push(octet ^ key);
+    }
+    response
 }
 
 /// Parses a STUN Binding Response and returns the IPv4 address the server saw
@@ -140,19 +172,36 @@ pub async fn query(
     let txid: [u8; 12] = rand::random();
     socket.send_to(&build_binding_request(&txid), server).await?;
 
-    let wait_for_response = async {
-        let mut buf = [0u8; 512];
-        loop {
-            let (len, _) = socket.recv_from(&mut buf).await?;
-            if let Ok(addr) = parse_binding_response(&buf[..len], &txid) {
-                return Ok::<SocketAddr, anyhow::Error>(addr);
-            }
-        }
-    };
+    let wait = wait_for_response(&txid, async |buf| {
+        socket.recv_from(buf).await.map(|(len, _)| len)
+    });
 
-    tokio::time::timeout(timeout, wait_for_response)
+    tokio::time::timeout(timeout, wait)
         .await
         .map_err(|_| anyhow!("STUN query to {} timed out", server))?
+}
+
+/// Reads datagrams with `recv` until one is the Binding Response for `txid`.
+/// Datagrams that are not are ignored, and so are the receive errors that
+/// belong to some other datagram (see [`is_transient`]): `probe_nat` reuses one
+/// socket for several queries, and on Windows the ICMP port-unreachable for an
+/// earlier send would otherwise fail the next receive of a healthy query.
+async fn wait_for_response(
+    txid: &[u8; 12],
+    mut recv: impl AsyncFnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> Result<SocketAddr> {
+    let mut buf = [0u8; 512];
+    loop {
+        match recv(&mut buf).await {
+            Ok(len) => {
+                if let Ok(addr) = parse_binding_response(&buf[..len], txid) {
+                    return Ok(addr);
+                }
+            }
+            Err(e) if is_transient(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Resolves a "host:port" STUN server to its first IPv4 address.
@@ -164,29 +213,53 @@ async fn resolve_ipv4(server: &str) -> Option<SocketAddr> {
 }
 
 /// Queries one STUN server by name; `None` if it does not resolve or answer.
-async fn query_by_name(socket: &tokio::net::UdpSocket, server: &str) -> Option<SocketAddr> {
+async fn query_by_name(
+    socket: &tokio::net::UdpSocket,
+    server: &str,
+    timeout: Duration,
+) -> Option<SocketAddr> {
     let server_addr = resolve_ipv4(server).await?;
-    query(socket, server_addr, PROBE_TIMEOUT).await.ok()
+    query(socket, server_addr, timeout).await.ok()
+}
+
+/// The STUN servers to use: the ones in `WHISPER_STUN_SERVERS` if it names any,
+/// else [`STUN_SERVERS`].
+pub fn stun_servers() -> Vec<String> {
+    list_from_env(STUN_SERVERS_ENV)
+        .unwrap_or_else(|| STUN_SERVERS.iter().map(|s| s.to_string()).collect())
 }
 
 /// Discovers our public address through `socket` and whether the NAT keeps the
-/// same mapping across destinations, by asking two independent STUN servers
-/// in sequence.
+/// same mapping across destinations, asking the servers from [`stun_servers`].
+pub async fn probe_nat(socket: &tokio::net::UdpSocket) -> (Option<SocketAddr>, NatMapping) {
+    probe_nat_with(socket, &stun_servers(), PROBE_TIMEOUT).await
+}
+
+/// [`probe_nat`] against an explicit list, waiting `timeout` for each server.
+/// The first two servers are asked, in sequence:
 ///
 /// - Both answered: `(Some(first), classify_mapping(first, second))`.
 /// - Only one answered: `(Some(it), Unknown)`.
-/// - Neither answered: the remaining `STUN_SERVERS` are tried just to learn
-///   our address (`(Some(addr), Unknown)`), else `(None, Unknown)`.
-pub async fn probe_nat(socket: &tokio::net::UdpSocket) -> (Option<SocketAddr>, NatMapping) {
-    let first = query_by_name(socket, PROBE_SERVERS[0]).await;
-    let second = query_by_name(socket, PROBE_SERVERS[1]).await;
+/// - Neither answered: the rest of the list is tried just to learn our address
+///   (`(Some(addr), Unknown)`), else `(None, Unknown)`.
+pub async fn probe_nat_with<S: AsRef<str>>(
+    socket: &tokio::net::UdpSocket,
+    servers: &[S],
+    timeout: Duration,
+) -> (Option<SocketAddr>, NatMapping) {
+    let ask = async |server: Option<&S>| match server {
+        Some(server) => query_by_name(socket, server.as_ref(), timeout).await,
+        None => None,
+    };
+    let first = ask(servers.first()).await;
+    let second = ask(servers.get(1)).await;
 
     match (first, second) {
         (Some(a), Some(b)) => (Some(a), classify_mapping(a, b)),
         (Some(addr), None) | (None, Some(addr)) => (Some(addr), NatMapping::Unknown),
         (None, None) => {
-            for server in STUN_SERVERS.iter().filter(|s| !PROBE_SERVERS.contains(s)) {
-                if let Some(addr) = query_by_name(socket, server).await {
+            for server in servers.iter().skip(2) {
+                if let Some(addr) = query_by_name(socket, server.as_ref(), timeout).await {
                     return (Some(addr), NatMapping::Unknown);
                 }
             }
@@ -198,26 +271,6 @@ pub async fn probe_nat(socket: &tokio::net::UdpSocket) -> (Option<SocketAddr>, N
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddrV4;
-
-    /// Builds a Binding Response (0x0101) carrying one XOR-MAPPED-ADDRESS
-    /// attribute (0x0020) for `addr` and the given transaction id.
-    fn response_for(txid: &[u8; 12], addr: SocketAddrV4) -> Vec<u8> {
-        let mut r = Vec::with_capacity(32);
-        r.extend_from_slice(&[0x01, 0x01]);
-        // Message length: one attribute = 4-byte header + 8-byte value
-        r.extend_from_slice(&[0x00, 12]);
-        r.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
-        r.extend_from_slice(txid);
-        r.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
-        r.extend_from_slice(&[0x00, 0x01]);
-        r.extend_from_slice(&(addr.port() ^ 0x2112).to_be_bytes());
-        let cookie = [0x21, 0x12, 0xA4, 0x42];
-        for (octet, key) in addr.ip().octets().iter().zip(cookie) {
-            r.push(octet ^ key);
-        }
-        r
-    }
 
     #[test]
     fn request_has_header_cookie_and_txid() {
@@ -228,18 +281,43 @@ mod tests {
     }
 
     #[test]
+    fn response_is_a_binding_response_with_xor_mapped_address() {
+        let r = build_binding_response(&[9; 12], "203.0.113.5:54321".parse().unwrap());
+        assert_eq!(
+            r,
+            [
+                &[0x01, 0x01, 0x00, 12][..], // Binding Response, 12 bytes of attributes
+                &[0x21, 0x12, 0xA4, 0x42],   // magic cookie
+                &[9; 12],                    // transaction id
+                &[0x00, 0x20, 0x00, 0x08],   // XOR-MAPPED-ADDRESS, 8 bytes
+                &[0x00, 0x01, 0xF5, 0x23],   // IPv4, port 54321 ^ 0x2112
+                &[0xEA, 0x12, 0xD5, 0x47],   // 203.0.113.5 ^ cookie
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn default_probe_pair_comes_from_two_operators() {
+        assert_eq!(
+            STUN_SERVERS[..2],
+            ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
+        );
+    }
+
+    #[test]
     fn parses_xor_mapped_address() {
         let txid = [7; 12];
         let addr: SocketAddrV4 = "203.0.113.5:54321".parse().unwrap();
         assert_eq!(
-            parse_binding_response(&response_for(&txid, addr), &txid).unwrap(),
+            parse_binding_response(&build_binding_response(&txid, addr), &txid).unwrap(),
             SocketAddr::V4(addr)
         );
     }
 
     #[test]
     fn rejects_wrong_txid_and_short_buffers() {
-        let resp = response_for(&[7; 12], "203.0.113.5:1".parse().unwrap());
+        let resp = build_binding_response(&[7; 12], "203.0.113.5:1".parse().unwrap());
         assert!(parse_binding_response(&resp, &[8; 12]).is_err());
         assert!(parse_binding_response(&[0u8; 10], &[0; 12]).is_err());
     }
@@ -265,14 +343,55 @@ mod tests {
             let txid: [u8; 12] = buf[8..20].try_into().unwrap();
             // Garbage and a response for another transaction come first.
             server.send_to(b"not stun", from).await.unwrap();
-            let other = response_for(&[0xEE; 12], "198.51.100.9:1".parse().unwrap());
+            let other = build_binding_response(&[0xEE; 12], "198.51.100.9:1".parse().unwrap());
             server.send_to(&other, from).await.unwrap();
-            server.send_to(&response_for(&txid, mapped), from).await.unwrap();
+            server.send_to(&build_binding_response(&txid, mapped), from).await.unwrap();
         });
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = query(&client, server_addr, Duration::from_secs(2)).await.unwrap();
         assert_eq!(addr, SocketAddr::V4(mapped));
+    }
+
+    /// Feeds `wait_for_response` the scripted receive results, one per call.
+    async fn wait_over(
+        txid: &[u8; 12],
+        script: Vec<std::io::Result<Vec<u8>>>,
+    ) -> Result<SocketAddr> {
+        let mut script = std::collections::VecDeque::from(script);
+        wait_for_response(txid, async |buf: &mut [u8]| {
+            let datagram = script.pop_front().expect("script ran out")?;
+            buf[..datagram.len()].copy_from_slice(&datagram);
+            Ok(datagram.len())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn stale_receive_errors_do_not_abort_a_query() {
+        use std::io::{Error, ErrorKind};
+        // What Windows does when an earlier send drew an ICMP port-unreachable.
+        let txid = [3; 12];
+        let mapped: SocketAddrV4 = "203.0.113.5:54321".parse().unwrap();
+        let addr = wait_over(
+            &txid,
+            vec![
+                Err(Error::from(ErrorKind::ConnectionReset)),
+                Ok(b"not stun".to_vec()),
+                Err(Error::from(ErrorKind::ConnectionReset)),
+                Ok(build_binding_response(&txid, mapped)),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(addr, SocketAddr::V4(mapped));
+    }
+
+    #[tokio::test]
+    async fn a_failing_socket_still_ends_the_query() {
+        use std::io::{Error, ErrorKind};
+        let result = wait_over(&[3; 12], vec![Err(Error::from(ErrorKind::PermissionDenied))]).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -281,6 +400,110 @@ mod tests {
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let result = query(&client, silent.local_addr().unwrap(), Duration::from_millis(100)).await;
         assert!(result.is_err());
+    }
+
+    const SHORT: Duration = Duration::from_millis(150);
+
+    /// A server that receives and never answers; keep the socket alive so the
+    /// sender gets no ICMP error either.
+    async fn silent_server() -> (tokio::net::UdpSocket, String) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        (socket, addr)
+    }
+
+    async fn loopback_client() -> tokio::net::UdpSocket {
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_servers_with_one_mapping_are_endpoint_independent() {
+        let r = spawn_responder().await.to_string();
+        let client = loopback_client().await;
+        let (addr, mapping) = probe_nat_with(&client, &[&r, &r], SHORT).await;
+        assert_eq!(addr, Some(client.local_addr().unwrap()));
+        assert_eq!(mapping, NatMapping::EndpointIndependent);
+    }
+
+    #[tokio::test]
+    async fn one_answering_probe_server_leaves_the_mapping_unknown() {
+        let r = spawn_responder().await.to_string();
+        let (_keep, silent) = silent_server().await;
+        let client = loopback_client().await;
+        let local = Some(client.local_addr().unwrap());
+
+        let answered_second = probe_nat_with(&client, &[&silent, &r], SHORT).await;
+        assert_eq!(answered_second, (local, NatMapping::Unknown));
+        let answered_first = probe_nat_with(&client, &[&r, &silent], SHORT).await;
+        assert_eq!(answered_first, (local, NatMapping::Unknown));
+        let only_one = probe_nat_with(&client, &[&r], SHORT).await;
+        assert_eq!(only_one, (local, NatMapping::Unknown));
+    }
+
+    #[tokio::test]
+    async fn the_rest_of_the_list_is_tried_when_both_probe_servers_are_silent() {
+        let r = spawn_responder().await.to_string();
+        let (_keep, silent) = silent_server().await;
+        let client = loopback_client().await;
+
+        let result = probe_nat_with(&client, &[&silent, &silent, &r], SHORT).await;
+        assert_eq!(
+            result,
+            (Some(client.local_addr().unwrap()), NatMapping::Unknown)
+        );
+        let nobody = probe_nat_with(&client, &[&silent, &silent], SHORT).await;
+        assert_eq!(nobody, (None, NatMapping::Unknown));
+        let empty: [&str; 0] = [];
+        assert_eq!(probe_nat_with(&client, &empty, SHORT).await, (None, NatMapping::Unknown));
+    }
+
+    /// Starts a STUN responder on a loopback port that answers every request
+    /// with the sender's own address, as a server on the public side would.
+    async fn spawn_responder() -> SocketAddr {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let (len, from) = server.recv_from(&mut buf).await.unwrap();
+                assert_eq!(len, 20);
+                let txid: [u8; 12] = buf[8..20].try_into().unwrap();
+                let SocketAddr::V4(from4) = from else { continue };
+                server.send_to(&build_binding_response(&txid, from4), from).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    /// Sets an environment variable for the length of one test.
+    struct EnvVar(&'static str);
+
+    impl EnvVar {
+        fn set(name: &'static str, value: &str) -> Self {
+            std::env::set_var(name, value);
+            EnvVar(name)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    // The only test that sets WHISPER_STUN_SERVERS (the process environment is
+    // shared by tests running in parallel): everything else goes through
+    // `probe_nat_with`. Only the ignored network test also reads it.
+    #[tokio::test]
+    async fn env_override_points_probe_at_local_responder() {
+        let responder = spawn_responder().await;
+        let _env = EnvVar::set(STUN_SERVERS_ENV, &format!("{responder}, {responder}"));
+
+        let client = loopback_client().await;
+        let (addr, mapping) = probe_nat(&client).await;
+
+        assert_eq!(addr, Some(client.local_addr().unwrap()));
+        assert_eq!(mapping, NatMapping::EndpointIndependent);
     }
 
     #[tokio::test]
