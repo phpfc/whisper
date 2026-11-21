@@ -49,6 +49,38 @@ pub fn verdict(s: &NetSummary) -> &'static str {
     }
 }
 
+/// What kind of network this is, as shown to the user when no direct path
+/// exists. Hosting comes first: a mapped port or IPv6 works even behind a
+/// symmetric NAT or CGNAT.
+pub fn describe(s: &NetSummary) -> &'static str {
+    let symmetric = s.nat == NatMapping::EndpointDependent;
+    let cgnat = s.cgnat == Some(true);
+    if s.can_host() {
+        "can host"
+    } else if symmetric && cgnat {
+        "symmetric NAT behind CGNAT"
+    } else if symmetric {
+        "symmetric NAT"
+    } else if cgnat {
+        "behind CGNAT, cannot host"
+    } else {
+        "cannot host (no IPv6, no port mapping)"
+    }
+}
+
+/// Why the connection failed, for the user. `remote` is `None` when the other
+/// peer's candidates never arrived.
+pub fn explain_no_path(own: &NetSummary, remote: Option<&NetSummary>) -> String {
+    match remote {
+        None => "The other peer never showed up. Check that the code is complete and that they are still waiting, or run `whisper doctor`.".to_string(),
+        Some(remote) => format!(
+            "No direct path. You: {}. Other peer: {}. Try another network (Wi-Fi instead of mobile data) or run `whisper doctor`.",
+            describe(own),
+            describe(remote)
+        ),
+    }
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "yes"
@@ -255,5 +287,64 @@ Verdict:       direct connections unlikely from this network
         let out = render(&r);
         assert!(out.contains("\nCGNAT:         unknown\n"));
         assert!(out.contains("\nNAT mapping:   unknown (STUN unreachable)\n"));
+    }
+
+    fn s(ipv6: bool, mapped: bool, cgnat: Option<bool>, nat: NatMapping) -> NetSummary {
+        NetSummary {
+            ipv6,
+            mapped,
+            cgnat,
+            nat,
+        }
+    }
+
+    #[test]
+    fn describes_networks() {
+        use NatMapping::*;
+        assert_eq!(
+            describe(&s(false, false, Some(true), EndpointDependent)),
+            "symmetric NAT behind CGNAT"
+        );
+        assert_eq!(
+            describe(&s(false, false, None, EndpointDependent)),
+            "symmetric NAT"
+        );
+        assert_eq!(
+            describe(&s(false, false, Some(true), EndpointIndependent)),
+            "behind CGNAT, cannot host"
+        );
+        assert_eq!(
+            describe(&s(false, false, None, Unknown)),
+            "cannot host (no IPv6, no port mapping)"
+        );
+        assert_eq!(describe(&s(false, true, None, Unknown)), "can host");
+    }
+
+    #[test]
+    fn hosting_wins_over_nat_and_cgnat() {
+        use NatMapping::*;
+        // A mapped port or IPv6 works even behind a symmetric NAT or CGNAT.
+        assert_eq!(
+            describe(&s(false, true, Some(true), EndpointDependent)),
+            "can host"
+        );
+        assert_eq!(
+            describe(&s(true, false, Some(true), EndpointDependent)),
+            "can host"
+        );
+    }
+
+    #[test]
+    fn explains_missing_and_blocked_peers() {
+        use NatMapping::*;
+        let own = s(false, false, Some(true), EndpointDependent);
+        assert_eq!(
+            explain_no_path(&own, None),
+            "The other peer never showed up. Check that the code is complete and that they are still waiting, or run `whisper doctor`."
+        );
+        assert_eq!(
+            explain_no_path(&own, Some(&s(false, false, None, Unknown))),
+            "No direct path. You: symmetric NAT behind CGNAT. Other peer: cannot host (no IPv6, no port mapping). Try another network (Wi-Fi instead of mobile data) or run `whisper doctor`."
+        );
     }
 }

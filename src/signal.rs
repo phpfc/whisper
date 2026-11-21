@@ -34,6 +34,9 @@ const TAG_LEN: usize = 16;
 const PUBLISH_ATTEMPTS: usize = 3;
 /// Pause between failed publish attempts.
 const PUBLISH_RETRY: Duration = Duration::from_secs(5);
+/// Shown when every publish attempt failed.
+const PUBLISH_WARNING: &str =
+    "Warning: could not publish to the DHT; the other peer can only reach you directly.";
 
 /// Starts a DHT client node that bootstraps from the default public nodes.
 pub fn public_dht() -> std::io::Result<AsyncDht> {
@@ -190,9 +193,13 @@ async fn publish_and_poll(
         if sig.publish(own, info).await.is_ok() {
             break;
         }
-        // Keep polling even if the peer will not be able to find us.
         if attempt < PUBLISH_ATTEMPTS {
             tokio::time::sleep(PUBLISH_RETRY).await;
+        } else if !tx.is_closed() {
+            // Out of attempts. Polling goes on anyway: we can still find the
+            // peer even if it cannot find us. Told only while the receiver is
+            // open; once it is dropped the chat may own the terminal.
+            eprintln!("{PUBLISH_WARNING}");
         }
     }
 

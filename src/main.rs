@@ -13,19 +13,31 @@ mod signal;
 mod stun;
 mod wire;
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
+use mainline::async_dht::AsyncDht;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use cancel::{Cancel, Cancelled};
 use candidates::{infer_kind, select_direct, Candidate};
 use cli::P2PChat;
 use code::SessionCode;
-use connect::{connect, ConnectArgs, Connection, PeerInfo, Role, Timeouts};
+use connect::{connect, unix_ms, ConnectArgs, ConnectError, Connection, PeerInfo, Role, Timeouts};
 use gather::{gather, Gathered};
 use keys::{derive_psk, SessionKeys, SessionSecret};
 use portmap::PortMap;
 use session::validate_username;
+use signal::{public_dht, spawn, Signaling};
+
+/// How often each peer looks for the other's record on the DHT.
+const SIGNAL_POLL: Duration = Duration::from_secs(3);
+
+const DHT_UNAVAILABLE: &str = "DHT unavailable; only direct connections will work.";
+
+const NO_DHT_NO_ADDRESS: &str = "The DHT is unreachable and this code has no direct address, so the other peer cannot be found. Check that this network allows UDP traffic.";
 
 #[derive(Parser)]
 #[command(name = "whisper")]
@@ -116,17 +128,74 @@ async fn gather_network(cancel: &Cancel) -> Result<Gathered> {
     Ok(gathered)
 }
 
-/// A receiver that never yields: nobody signals us until the DHT is wired in.
+/// A receiver that never yields: nobody signals us when the DHT is down, and
+/// only the addresses we already know can work.
 fn closed_signal() -> mpsc::Receiver<PeerInfo> {
     let (_tx, rx) = mpsc::channel(1);
     rx
 }
 
+/// A DHT node being started.
+type DhtStart = JoinHandle<std::io::Result<AsyncDht>>;
+
+/// Starts the DHT node while the network is still being gathered, so it has
+/// bootstrapped by the time we publish. Off the async workers: the node
+/// resolves the bootstrap hostnames with blocking DNS lookups before it
+/// returns, which can stall for seconds on a bad network.
+fn start_dht() -> DhtStart {
+    tokio::task::spawn_blocking(public_dht)
+}
+
+/// Publishes our candidates over the DHT and returns the peer's as they show
+/// up. `None` when the DHT node could not start. Ctrl-C releases the router
+/// mapping, like everywhere else.
+async fn signal_over_dht(
+    dht: DhtStart,
+    role: Role,
+    keys: &SessionKeys,
+    gathered: &mut Gathered,
+    cancel: &Cancel,
+) -> Result<Option<mpsc::Receiver<PeerInfo>>> {
+    let node = match cancel.run(dht).await {
+        Ok(started) => started.ok().and_then(Result::ok),
+        Err(cancelled) => {
+            close_portmap(gathered.portmap.take()).await;
+            return Err(cancelled.into());
+        }
+    };
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    let info = PeerInfo {
+        candidates: gathered.candidates.clone(),
+        summary: gathered.summary.clone(),
+        published_ms: unix_ms(),
+    };
+    Ok(Some(spawn(
+        Signaling::new(keys, node),
+        role,
+        info,
+        SIGNAL_POLL,
+    )))
+}
+
+/// The DHT is down. A joiner can still try the addresses in the code, but
+/// with none there is nobody to try.
+fn without_dht(code: &SessionCode) -> Result<mpsc::Receiver<PeerInfo>> {
+    if code.direct.is_empty() {
+        bail!(NO_DHT_NO_ADDRESS);
+    }
+    println!("{DHT_UNAVAILABLE}");
+    Ok(closed_signal())
+}
+
 async fn create_session(username: &str, password: Option<&str>, cancel: &Cancel) -> Result<()> {
     check_username(username)?;
-    let gathered = gather_network(cancel).await?;
+    let dht = start_dht();
+    let mut gathered = gather_network(cancel).await?;
 
     let secret = SessionSecret::generate();
+    let keys = SessionKeys::derive(&secret);
     let code = SessionCode {
         secret,
         direct: select_direct(&gathered.candidates),
@@ -145,14 +214,24 @@ async fn create_session(username: &str, password: Option<&str>, cancel: &Cancel)
     println!("========================================");
     println!();
 
+    // After the code is out: the publish happens in the background and must
+    // not hold it back.
+    let remote_rx = match signal_over_dht(dht, Role::Creator, &keys, &mut gathered, cancel).await? {
+        Some(rx) => rx,
+        None => {
+            println!("{DHT_UNAVAILABLE}");
+            closed_signal()
+        }
+    };
+
     run_session(
         Role::Creator,
         username,
         password,
         gathered,
-        SessionKeys::derive(&secret),
+        keys,
         vec![],
-        closed_signal(),
+        remote_rx,
         cancel,
     )
     .await
@@ -167,7 +246,22 @@ async fn join_session(
     check_username(username)?;
     // A bad code fails right away, before anything is opened on the router.
     let code = SessionCode::decode(code)?;
-    let gathered = gather_network(cancel).await?;
+    let dht = start_dht();
+    let mut gathered = gather_network(cancel).await?;
+    let keys = SessionKeys::derive(&code.secret);
+
+    // Without the DHT and without an address in the code there is no way to
+    // find the creator: say so now instead of after the wait.
+    let remote_rx = match signal_over_dht(dht, Role::Joiner, &keys, &mut gathered, cancel).await? {
+        Some(rx) => rx,
+        None => match without_dht(&code) {
+            Ok(rx) => rx,
+            Err(e) => {
+                close_portmap(gathered.portmap.take()).await;
+                return Err(e);
+            }
+        },
+    };
 
     let initial_remote = code
         .direct
@@ -183,9 +277,9 @@ async fn join_session(
         username,
         password,
         gathered,
-        SessionKeys::derive(&code.secret),
+        keys,
         initial_remote,
-        closed_signal(),
+        remote_rx,
         cancel,
     )
     .await
@@ -206,7 +300,10 @@ async fn run_session(
     cancel: &Cancel,
 ) -> Result<()> {
     let Gathered {
-        sockets, portmap, ..
+        sockets,
+        portmap,
+        summary,
+        ..
     } = gathered;
 
     // Argon2 is slow on purpose: derive the key once.
@@ -244,6 +341,9 @@ async fn run_session(
             );
             run_chat(username, conn).await
         }
+        Err(ConnectError::NoPath { remote }) => {
+            Err(anyhow!(doctor::explain_no_path(&summary, remote.as_ref())))
+        }
         Err(e) => Err(e.into()),
     };
 
@@ -263,5 +363,28 @@ async fn run_chat(username: &str, conn: Connection) -> Result<()> {
 async fn close_portmap(portmap: Option<PortMap>) {
     if let Some(portmap) = portmap {
         portmap.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keys::SessionSecret;
+
+    fn code(direct: &[&str]) -> SessionCode {
+        SessionCode {
+            secret: SessionSecret([1; 16]),
+            direct: direct.iter().map(|a| a.parse().unwrap()).collect(),
+        }
+    }
+
+    #[test]
+    fn join_without_dht_needs_a_direct_address() {
+        let e = without_dht(&code(&[])).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "The DHT is unreachable and this code has no direct address, so the other peer cannot be found. Check that this network allows UDP traffic."
+        );
+        assert!(without_dht(&code(&["189.40.12.34:5000"])).is_ok());
     }
 }
