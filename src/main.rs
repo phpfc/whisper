@@ -2,6 +2,7 @@ mod candidates;
 mod cli;
 mod crypto;
 mod hole_punch;
+mod portmap;
 mod session;
 mod stun;
 
