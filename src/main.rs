@@ -4,6 +4,7 @@ mod crypto;
 mod doctor;
 mod gather;
 mod hole_punch;
+mod keys;
 mod portmap;
 mod session;
 mod signal;
