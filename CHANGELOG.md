@@ -30,13 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The password (`-p`) is optional. If used, both peers must pass the same one. It now takes
-  part in the key (Argon2id), where before it was never used by the key exchange
+  part in the key (Argon2id). 0.2 hashed the password but never used the hash
 - Messages are limited to 1000 bytes
 - `README.md` and `ARCHITECTURE.md` describe the zero-infrastructure model
 - `SECURITY.md` rewritten for the current protocol
 
 ### Removed
-- One-sided hole punching and the unauthenticated X25519 key exchange
+- One-sided hole punching, and the 0.2 X25519 key exchange, which was unauthenticated
 - `P2P_TROUBLESHOOTING.md`, `RELAYS.md` and `DEPLOY.md`, which described the relay model
 
 ## [0.1.0] - 2026-03-06

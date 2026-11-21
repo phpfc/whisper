@@ -194,9 +194,10 @@ on the shared socket (STUN starts with `0x00`..`0x3F`).
 | Replay | 64-packet sliding window, as in WireGuard |
 | Fingerprint | First 16 bytes of the handshake hash, shown on both sides |
 
-A wrong password or a wrong code fails the handshake and shows `wrong password or invalid
-code`. Messages are at most 1000 bytes, so a datagram stays under 1200 bytes and is never
-fragmented.
+A wrong password fails the handshake and shows `wrong password or invalid code`. A wrong
+secret in the code never gets that far: its probes carry a tag that does not verify, so
+nobody answers and no handshake starts. Messages are at most 1000 bytes, so a datagram stays
+under 1200 bytes and is never fragmented.
 
 ## Timeouts
 
@@ -219,12 +220,12 @@ fragmented.
 | Scenario | Behavior |
 |----------|----------|
 | No one joins | After 10 min: `No one joined within 10 minutes. Create a new session to try again.` |
-| Wrong password or code | `wrong password or invalid code` |
+| Wrong password | `wrong password or invalid code`, 5 s after the first handshake message |
 | Code from 0.2 | Says it is from an older version and to ask for a new one |
-| Code cut short or mistyped | `Invalid session code. Check that you copied all of it...` |
+| Code cut short or mistyped | `Invalid session code. Check that you copied all of it...` if it no longer parses. If it still parses, its secret is wrong and it ends as "Other peer never seen" below |
 | Old code | `This session code has expired. Ask your peer for a new one.` |
 | No direct path | `No direct path. You: ... Other peer: ...`, naming symmetric NAT, CGNAT or "cannot host" for each side, and pointing to `whisper doctor` |
-| Other peer never seen | `The other peer never showed up. Check that the code is complete and that they are still waiting...` |
+| Other peer never seen | After 60 s with no record from the creator: `The other peer never showed up. Check that the code is complete and that they are still waiting...`. Also what a wrong secret in the code ends in |
 | DHT unreachable | With a direct address in the code, only direct connections are tried. Without one, the joiner stops and says why |
 | Peer goes silent | `Connection to X lost.` in the chat |
 

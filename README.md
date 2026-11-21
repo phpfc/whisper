@@ -91,7 +91,10 @@ whisper create -u alice -p mysecret
 whisper join "<code>" -u bob -p mysecret
 ```
 
-A wrong password or a wrong code fails with `wrong password or invalid code`.
+A wrong password fails with `wrong password or invalid code`. A code that is cut short or
+mistyped is rejected at once with `Invalid session code...` if it no longer parses. If it still
+parses but carries the wrong secret, nobody answers the joiner, and after about a minute it
+ends with `The other peer never showed up...`.
 
 ### Check your network
 ```bash

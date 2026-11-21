@@ -28,8 +28,10 @@ adversary correlating traffic across the whole network.
   valid tag get no reply, so the open port is not a reflector and does not answer scans
 - **DHT records**: encrypted with ChaCha20-Poly1305 under a key derived from the code, and
   signed with a key derived from it too. Without the code they can be neither found nor read
-- **Wrong password or code**: the handshake fails and you get `wrong password or invalid
-  code`
+- **Wrong password or code**: with the right code and a wrong password the handshake fails
+  and you get `wrong password or invalid code`. With a wrong code no handshake starts: its
+  probes do not verify, nobody answers, and the joiner ends with `The other peer never
+  showed up...`
 - **Router port**: opened only while whisper runs and closed on exit. If the process is
   killed, the router drops it when its 2-hour lease ends, and nothing listens on it meanwhile
 
