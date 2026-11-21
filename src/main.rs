@@ -1,3 +1,4 @@
+mod candidates;
 mod cli;
 mod crypto;
 mod hole_punch;
