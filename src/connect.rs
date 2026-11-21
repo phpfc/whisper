@@ -35,8 +35,13 @@ use crate::keys::SessionKeys;
 use crate::session::validate_username;
 use crate::wire::{probe, probe_ack, verify, ChatPayload, Packet, MAX_DATAGRAM};
 
-/// Probe transaction ids still waiting for a `ProbeAck` are forgotten after this.
+/// Probe transaction ids, ours waiting for a `ProbeAck` and the peer's already
+/// answered, are forgotten after this.
 const TXID_TTL: Duration = Duration::from_secs(5);
+
+/// At most this many peer-reflexive candidates are learned. A replayed probe
+/// with a spoofed source must not turn us into a prober of arbitrary hosts.
+const MAX_PEER_REFLEXIVE: usize = 4;
 
 /// Receive buffer size, above anything we send: a bigger datagram is junk.
 const RECV_BUF: usize = 2048;
@@ -75,6 +80,8 @@ pub struct Timeouts {
     /// Time between two sends of the same `Hs1`.
     pub hs_retry: Duration,
     /// The joiner gives up with `WrongPassword` this long after its first `Hs1`.
+    /// A handshake under way (the joiner's `Hs1`, the creator's `Hs2`) holds
+    /// off the other deadlines for this long.
     pub wrong_password_after: Duration,
     /// The creator gives up with `NoOneJoined` after this long.
     pub creator_wait: Duration,
@@ -182,8 +189,7 @@ pub async fn connect(
                 checks.resend_hs1(Instant::now());
                 Ok(None)
             }
-            _ = sleep_opt(checks.wrong_password_at()) => Err(ConnectError::WrongPassword),
-            _ = sleep_until(checks.deadline) => Err(checks.deadline_error()),
+            _ = sleep_until(checks.effective_deadline()) => Err(checks.deadline_error()),
         };
         for (to, bytes) in checks.outbox.drain(..) {
             if let Some(socket) = socket_for(&sockets, to) {
@@ -238,6 +244,7 @@ struct Answered {
     hs1: Vec<u8>,
     /// The encoded `Hs2` packet sent back.
     hs2: Vec<u8>,
+    hs2_sent: Instant,
     session: Session,
 }
 
@@ -253,6 +260,9 @@ struct Checks<'a> {
     remote: Vec<Candidate>,
     /// Probes sent: txid -> (destination, when).
     pending: HashMap<[u8; 12], (SocketAddr, Instant)>,
+    /// Valid probes received: txid -> last seen. A replay is still answered
+    /// but teaches no new address.
+    seen_probes: HashMap<[u8; 12], Instant>,
     /// Addresses that answered a probe of ours, in order of confirmation.
     confirmed: Vec<SocketAddr>,
     remote_summary: Option<NetSummary>,
@@ -283,6 +293,7 @@ impl<'a> Checks<'a> {
             has_v6,
             remote,
             pending: HashMap::new(),
+            seen_probes: HashMap::new(),
             confirmed: Vec::new(),
             remote_summary: None,
             deadline: now + wait,
@@ -297,6 +308,8 @@ impl<'a> Checks<'a> {
     fn send_probes(&mut self, now: Instant) {
         self.pending
             .retain(|_, (_, sent)| now.duration_since(*sent) < TXID_TTL);
+        self.seen_probes
+            .retain(|_, seen| now.duration_since(*seen) < TXID_TTL);
         for c in &self.remote {
             if c.addr.is_ipv6() && !self.has_v6 {
                 continue;
@@ -318,8 +331,24 @@ impl<'a> Checks<'a> {
         }
     }
 
+    /// When to give up. A handshake under way is never cut short:
+    /// - joiner: `max(deadline, first Hs1 + wrong_password_after)`, and
+    ///   `WrongPassword` is due at `first Hs1 + wrong_password_after` anyway,
+    ///   so that instant is the answer;
+    /// - creator: `max(deadline, Hs2 + wrong_password_after)`.
+    fn effective_deadline(&self) -> Instant {
+        let grace = self.t.wrong_password_after;
+        match (&self.dialing, &self.answered) {
+            (Some(d), _) => d.first_sent + grace,
+            (None, Some(a)) => self.deadline.max(a.hs2_sent + grace),
+            (None, None) => self.deadline,
+        }
+    }
+
     fn deadline_error(&self) -> ConnectError {
         match (self.role, &self.remote_summary) {
+            // A path answered; the peer never accepted our handshake.
+            (Role::Joiner, _) if self.dialing.is_some() => ConnectError::WrongPassword,
             (Role::Creator, None) => ConnectError::NoOneJoined,
             (_, remote) => ConnectError::NoPath {
                 remote: remote.clone(),
@@ -357,16 +386,20 @@ impl<'a> Checks<'a> {
         };
         match packet {
             Packet::Probe { txid, .. } if verify(&self.probe_key, &packet) => {
+                // One answer per probe, replay or not: never more traffic out
+                // than in. Only a fresh txid may teach us its source.
                 self.outbox
                     .push((src, probe_ack(&self.probe_key, txid).encode()));
-                self.learn(src);
+                if self.seen_probes.insert(txid, now).is_none() {
+                    self.learn(src);
+                }
             }
             Packet::ProbeAck { txid, .. } if verify(&self.probe_key, &packet) => {
                 if self.pending.remove(&txid).is_some() {
                     self.confirm(src, now);
                 }
             }
-            Packet::Hs1(body) if self.role == Role::Creator => self.answer(src, body)?,
+            Packet::Hs1(body) if self.role == Role::Creator => self.answer(src, body, now)?,
             Packet::Hs2(body) if self.role == Role::Joiner => return self.finish(src, body),
             Packet::Data { nonce, ciphertext } if self.role == Role::Creator => {
                 return Ok(self.first_data(src, nonce, ciphertext));
@@ -376,20 +409,30 @@ impl<'a> Checks<'a> {
         Ok(None)
     }
 
-    /// A source we did not know about becomes a peer-reflexive candidate.
-    fn learn(&mut self, src: SocketAddr) {
-        add_candidate(
-            &mut self.remote,
-            Candidate {
-                kind: CandidateKind::PeerReflexive,
-                addr: src,
-            },
-        );
+    /// A source we did not know about becomes a peer-reflexive candidate,
+    /// up to `MAX_PEER_REFLEXIVE` (no eviction). Returns whether `src` is a
+    /// candidate now.
+    fn learn(&mut self, src: SocketAddr) -> bool {
+        if self.remote.iter().any(|c| c.addr == src) {
+            return true;
+        }
+        let learned = self
+            .remote
+            .iter()
+            .filter(|c| c.kind == CandidateKind::PeerReflexive)
+            .count();
+        if learned >= MAX_PEER_REFLEXIVE || !usable(src) {
+            return false;
+        }
+        self.remote.push(Candidate {
+            kind: CandidateKind::PeerReflexive,
+            addr: src,
+        });
+        true
     }
 
     fn confirm(&mut self, src: SocketAddr, now: Instant) {
-        self.learn(src);
-        if self.confirmed.contains(&src) {
+        if !self.learn(src) || self.confirmed.contains(&src) {
             return;
         }
         self.confirmed.push(src);
@@ -424,12 +467,6 @@ impl<'a> Checks<'a> {
 
     fn resend_at(&self) -> Option<Instant> {
         self.dialing.as_ref().map(|d| d.next_resend)
-    }
-
-    fn wrong_password_at(&self) -> Option<Instant> {
-        self.dialing
-            .as_ref()
-            .map(|d| d.first_sent + self.t.wrong_password_after)
     }
 
     fn resend_hs1(&mut self, now: Instant) {
@@ -477,12 +514,12 @@ impl<'a> Checks<'a> {
     }
 
     /// Creator: an `Hs1`.
-    fn answer(&mut self, src: SocketAddr, body: &[u8]) -> Result<(), ConnectError> {
+    fn answer(&mut self, src: SocketAddr, body: &[u8], now: Instant) -> Result<(), ConnectError> {
         if let Some(a) = self.answered.as_ref().filter(|a| a.hs1 == body) {
             self.outbox.push((src, a.hs2.clone()));
             return Ok(());
         }
-        match respond(&self.psk, body, self.username, src)? {
+        match respond(&self.psk, body, self.username, src, now)? {
             Some(a) => {
                 self.outbox.push((src, a.hs2.clone()));
                 self.answered = Some(a);
@@ -506,13 +543,15 @@ impl<'a> Checks<'a> {
     }
 }
 
-/// Creator's half of the handshake. `None` when `hs1` does not authenticate
-/// (wrong password, junk) or carries an invalid username.
+/// Creator's half of the handshake; the `Hs2` goes out at `now`. `None` when
+/// `hs1` does not authenticate (wrong password, junk) or carries an invalid
+/// username.
 fn respond(
     psk: &[u8; 32],
     hs1: &[u8],
     username: &str,
     peer: SocketAddr,
+    now: Instant,
 ) -> Result<Option<Answered>, ConnectError> {
     let mut hs = responder(psk).map_err(local_fault)?;
     let mut payload = vec![0u8; hs1.len()];
@@ -530,6 +569,7 @@ fn respond(
     Ok(Some(Answered {
         hs1: hs1.to_vec(),
         hs2: Packet::Hs2(&msg[..len]).encode(),
+        hs2_sent: now,
         session: Session {
             peer,
             transport,
@@ -870,6 +910,129 @@ mod tests {
         assert!(silent, "the creator answered junk");
     }
 
+    /// Everything `s` receives until `until`.
+    async fn received(s: &UdpSocket, until: Instant) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(Ok((n, _))) = tokio::time::timeout_at(until, s.recv_from(&mut buf)).await {
+            out.push(buf[..n].to_vec());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn replayed_probe_teaches_at_most_one_address() {
+        let keys = SessionKeys::derive(&SessionSecret([11; 16]));
+        let (cs, caddr) = loopback_sockets().await;
+        let creator = connect(
+            cs,
+            args(Role::Creator, &keys, [7; 32], "alice", vec![]),
+            closed_rx(),
+        );
+        let mut replayers = Vec::new();
+        for _ in 0..3 {
+            replayers.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let watch = async {
+            // One genuine probe, then the same bytes replayed from two more sources.
+            let bytes = probe(&keys.probe_key, [7; 12]).encode();
+            for s in &replayers {
+                s.send_to(&bytes, caddr).await.unwrap();
+            }
+            let until = Instant::now() + ms(400);
+            let (a, b, c) = tokio::join!(
+                received(&replayers[0], until),
+                received(&replayers[1], until),
+                received(&replayers[2], until)
+            );
+            [a, b, c]
+        };
+        tokio::pin!(creator);
+        let got = tokio::select! {
+            c = &mut creator => panic!("creator stopped: {:?}", c.err()),
+            got = watch => got,
+        };
+        let count = |packets: &[Vec<u8>], probes: bool| {
+            packets
+                .iter()
+                .filter(|p| match Packet::decode(p) {
+                    Some(Packet::ProbeAck { txid, .. }) => !probes && txid == [7; 12],
+                    Some(Packet::Probe { .. }) => probes,
+                    _ => false,
+                })
+                .count()
+        };
+        // Each copy is answered once (1:1, no amplification)...
+        let acks: Vec<usize> = got.iter().map(|p| count(p, false)).collect();
+        assert_eq!(acks, [1, 1, 1]);
+        // ...but only the first source became a candidate worth probing.
+        let probed: Vec<bool> = got.iter().map(|p| count(p, true) > 0).collect();
+        assert_eq!(probed, [true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn joiner_handshake_outlives_no_path_deadline() {
+        let keys = SessionKeys::derive(&SessionSecret([12; 16]));
+        let (psk_a, psk_b) = (derive_psk(&keys, "a"), derive_psk(&keys, "b"));
+        let (cs, caddr) = loopback_sockets().await;
+        let (js, _) = loopback_sockets().await;
+        let mut ja = args(Role::Joiner, &keys, psk_b, "bob", vec![lan(caddr)]);
+        ja.timeouts.joiner_without_remote = ms(800);
+        let started = Instant::now();
+        // The creator shows up at ~300 ms, so the first Hs1 leaves at ~350 ms
+        // and its wrong-password wait (1 s) runs past the 800 ms deadline.
+        let creator = async {
+            tokio::time::sleep(ms(300)).await;
+            let ca = args(Role::Creator, &keys, psk_a, "alice", vec![]);
+            connect(cs, ca, closed_rx()).await
+        };
+        tokio::pin!(creator);
+        let j = tokio::select! {
+            c = &mut creator => panic!("creator stopped waiting: {:?}", c.err()),
+            j = connect(js, ja, closed_rx()) => j,
+        };
+        let elapsed = started.elapsed();
+        let e = err(j);
+        assert!(matches!(e, ConnectError::WrongPassword), "{e:?}");
+        assert!(elapsed >= ms(1200) && elapsed < ms(2500), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn creator_handshake_outlives_no_path_deadline() {
+        let keys = SessionKeys::derive(&SessionSecret([13; 16]));
+        let psk = [7; 32];
+        let (cs, caddr) = loopback_sockets().await;
+        let fake_joiner = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(info(vec![])).await.unwrap();
+        let mut ca = args(Role::Creator, &keys, psk, "alice", vec![]);
+        ca.timeouts.joiner_with_remote = ms(800);
+        let started = Instant::now();
+        // Sends a valid Hs1 at ~300 ms, takes the Hs2 and never sends Data.
+        let joiner = async {
+            tokio::time::sleep(ms(300)).await;
+            let mut hs = initiator(&psk).unwrap();
+            let mut msg = [0u8; 128];
+            let n = hs.write_message(b"bob", &mut msg).unwrap();
+            let hs1 = Packet::Hs1(&msg[..n]).encode();
+            fake_joiner.send_to(&hs1, caddr).await.unwrap();
+            let got = received(&fake_joiner, Instant::now() + ms(300)).await;
+            assert!(got
+                .iter()
+                .any(|p| matches!(Packet::decode(p), Some(Packet::Hs2(_)))));
+        };
+        let (c, ()) = tokio::join!(connect(cs, ca, rx), joiner);
+        let elapsed = started.elapsed();
+        let e = err(c);
+        assert!(
+            matches!(e, ConnectError::NoPath { remote: Some(_) }),
+            "{e:?}"
+        );
+        // Not at 800 ms: the answered handshake gets 1 s from the Hs2 (~300 ms).
+        assert!(elapsed >= ms(1200) && elapsed < ms(2500), "{elapsed:?}");
+        drop(tx);
+    }
+
     #[test]
     fn candidates_are_filtered_merged_and_ranked() {
         use CandidateKind::*;
@@ -957,6 +1120,42 @@ mod tests {
             (done.peer_username.as_str(), done.fingerprint),
             ("bob", session.fingerprint)
         );
+    }
+
+    #[test]
+    fn peer_reflexive_candidates_are_capped() {
+        let keys = SessionKeys::derive(&SessionSecret([9; 16]));
+        let known = lan("10.0.0.9:5".parse().unwrap());
+        let a = args(Role::Joiner, &keys, [7; 32], "bob", vec![known]);
+        let now = Instant::now();
+        let mut checks = Checks::new(&a, false, now);
+        let learned = |c: &Checks| {
+            c.remote
+                .iter()
+                .filter(|c| c.kind == CandidateKind::PeerReflexive)
+                .count()
+        };
+
+        // Six fresh probes from six sources: all answered, only four learned.
+        for i in 0..6u8 {
+            let src = SocketAddr::from(([127, 0, 0, 1], 3000 + u16::from(i)));
+            let fresh = probe(&keys.probe_key, [i; 12]).encode();
+            checks.on_datagram(src, &fresh, now).unwrap();
+        }
+        assert_eq!(std::mem::take(&mut checks.outbox).len(), 6);
+        assert_eq!(learned(&checks), 4);
+        assert_eq!(checks.remote[0], known);
+
+        // A ProbeAck from yet another source cannot get past the cap either.
+        checks.send_probes(now);
+        let txid = *checks.pending.keys().next().unwrap();
+        let ack = probe_ack(&keys.probe_key, txid).encode();
+        checks
+            .on_datagram("127.0.0.1:4000".parse().unwrap(), &ack, now)
+            .unwrap();
+        assert_eq!(learned(&checks), 4);
+        assert!(checks.confirmed.is_empty());
+        assert!(checks.tiebreak_at.is_none());
     }
 
     #[test]
