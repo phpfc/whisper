@@ -335,12 +335,14 @@ impl<'a> Checks<'a> {
     /// - joiner: `max(deadline, first Hs1 + wrong_password_after)`, and
     ///   `WrongPassword` is due at `first Hs1 + wrong_password_after` anyway,
     ///   so that instant is the answer;
-    /// - creator: `max(deadline, Hs2 + wrong_password_after)`.
+    /// - creator: `max(deadline, min(Hs2, deadline) + wrong_password_after)`,
+    ///   so a stream of new `Hs1`s never pushes it past
+    ///   `deadline + wrong_password_after`.
     fn effective_deadline(&self) -> Instant {
         let grace = self.t.wrong_password_after;
         match (&self.dialing, &self.answered) {
             (Some(d), _) => d.first_sent + grace,
-            (None, Some(a)) => self.deadline.max(a.hs2_sent + grace),
+            (None, Some(a)) => self.deadline.max(a.hs2_sent.min(self.deadline) + grace),
             (None, None) => self.deadline,
         }
     }
@@ -519,7 +521,16 @@ impl<'a> Checks<'a> {
             self.outbox.push((src, a.hs2.clone()));
             return Ok(());
         }
+        let grace = self.t.wrong_password_after;
+        let busy = self
+            .answered
+            .as_ref()
+            .is_some_and(|a| now < a.hs2_sent + grace);
         match respond(&self.psk, body, self.username, src, now)? {
+            // Another valid Hs1 while the accepted handshake can still finish:
+            // keep it, and answer nothing so the newcomer fails cleanly with
+            // WrongPassword instead of stealing the session.
+            Some(_) if busy => {}
             Some(a) => {
                 self.outbox.push((src, a.hs2.clone()));
                 self.answered = Some(a);
@@ -1120,6 +1131,83 @@ mod tests {
             (done.peer_username.as_str(), done.fingerprint),
             ("bob", session.fingerprint)
         );
+    }
+
+    /// A joiner that picked `to` and sent its `Hs1`, with that `Hs1` packet.
+    fn dialing_joiner<'a>(
+        a: &ConnectArgs<'a>,
+        to: SocketAddr,
+        now: Instant,
+    ) -> (Checks<'a>, Vec<u8>) {
+        let mut joiner = Checks::new(a, false, now);
+        joiner.confirm(to, now);
+        joiner.choose_path(now).unwrap();
+        let (_, hs1) = joiner.outbox.pop().unwrap();
+        (joiner, hs1)
+    }
+
+    #[test]
+    fn competing_hs1_does_not_take_over_the_accepted_handshake() {
+        let keys = SessionKeys::derive(&SessionSecret([14; 16]));
+        let (psk, now) = ([7; 32], Instant::now());
+        let ca = args(Role::Creator, &keys, psk, "alice", vec![]);
+        let aa = args(Role::Joiner, &keys, psk, "bob", vec![]);
+        let ba = args(Role::Joiner, &keys, psk, "carol", vec![]);
+        let caddr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let a_addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let mut creator = Checks::new(&ca, false, now);
+        let (mut a, a_hs1) = dialing_joiner(&aa, caddr, now);
+        let (_b, b_hs1) = dialing_joiner(&ba, caddr, now);
+
+        creator.on_datagram(a_addr, &a_hs1, now).unwrap();
+        let (_, hs2_a) = creator.outbox.pop().unwrap();
+        let session = a.on_datagram(caddr, &hs2_a, now).unwrap().unwrap();
+
+        // B's equally valid Hs1 lands between Hs2_A and A's Ping: no answer
+        // and no warning, so B fails cleanly with WrongPassword.
+        creator.on_datagram(b_addr, &b_hs1, now + ms(10)).unwrap();
+        assert!(creator.outbox.is_empty());
+        assert!(!creator.warned);
+
+        // A's Ping still completes the creator, with A.
+        let ping = a.outbox.remove(0).1;
+        let done = creator
+            .on_datagram(a_addr, &ping, now + ms(20))
+            .unwrap()
+            .unwrap();
+        assert_eq!((done.peer, done.peer_username.as_str()), (a_addr, "bob"));
+        assert_eq!(done.fingerprint, session.fingerprint);
+    }
+
+    #[test]
+    fn alternating_hs1s_cannot_stretch_the_creator_deadline() {
+        let keys = SessionKeys::derive(&SessionSecret([15; 16]));
+        let (psk, t0) = ([7; 32], Instant::now());
+        let ca = args(Role::Creator, &keys, psk, "alice", vec![]);
+        let aa = args(Role::Joiner, &keys, psk, "bob", vec![]);
+        let ba = args(Role::Joiner, &keys, psk, "carol", vec![]);
+        let caddr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let a_addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let mut creator = Checks::new(&ca, false, t0);
+        let (_a, a_hs1) = dialing_joiner(&aa, caddr, t0);
+        let (_b, b_hs1) = dialing_joiner(&ba, caddr, t0);
+        let grace = ca.timeouts.wrong_password_after;
+        let limit = creator.deadline + grace;
+
+        // A new valid Hs1 every wrong_password_after, until well past the
+        // 3 s deadline. Each lands after the previous window, so it takes over.
+        for i in 0..10u32 {
+            let (src, hs1) = if i % 2 == 0 {
+                (a_addr, &a_hs1)
+            } else {
+                (b_addr, &b_hs1)
+            };
+            creator.on_datagram(src, hs1, t0 + grace * i).unwrap();
+            assert_eq!(std::mem::take(&mut creator.outbox).len(), 1, "Hs1 #{i}");
+            assert!(creator.effective_deadline() <= limit, "Hs1 #{i}");
+        }
     }
 
     #[test]
