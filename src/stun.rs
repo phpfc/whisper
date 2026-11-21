@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Public STUN servers - free, reliable, always available
@@ -29,30 +29,6 @@ pub enum NatMapping {
     EndpointDependent,
     /// Not enough STUN answers to tell.
     Unknown,
-}
-
-/// Discovers our public IP:port as seen from the internet.
-/// Uses STUN protocol to query public servers.
-///
-/// Note: This creates a temporary socket for STUN queries to avoid
-/// issues with the main socket binding.
-pub fn discover_public_endpoint() -> Result<(UdpSocket, SocketAddr)> {
-    // Create a fresh socket for STUN
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-
-    let mut last_error = None;
-    for server in STUN_SERVERS {
-        match query_stun_server(&socket, server) {
-            Ok(addr) => return Ok((socket, addr)),
-            Err(e) => {
-                last_error = Some(e);
-                continue;
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!(
-        "Failed to discover public address. Check your internet connection."
-    )))
 }
 
 /// Builds a STUN Binding Request (no attributes) for the given transaction id.
@@ -141,26 +117,6 @@ pub fn parse_binding_response(buf: &[u8], txid: &[u8; 12]) -> Result<SocketAddr>
     }
 
     Err(anyhow!("No address found in STUN response"))
-}
-
-fn query_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-    // Get IPv4 address only (filter out IPv6)
-    let server_addr = server
-        .to_socket_addrs()?
-        .find(|addr| addr.is_ipv4())
-        .ok_or_else(|| anyhow!("Failed to resolve STUN server to IPv4"))?;
-
-    // Set timeout for this query
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let transaction_id: [u8; 12] = rand::random();
-    socket.send_to(&build_binding_request(&transaction_id), server_addr)?;
-
-    let mut buf = [0u8; 256];
-    let (len, _) = socket.recv_from(&mut buf)?;
-
-    parse_binding_response(&buf[..len], &transaction_id)
 }
 
 /// Compares the external address two different STUN servers saw for the same
@@ -325,15 +281,6 @@ mod tests {
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let result = query(&client, silent.local_addr().unwrap(), Duration::from_millis(100)).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    #[ignore] // Requires network
-    fn test_stun_discovery() {
-        let result = discover_public_endpoint();
-        assert!(result.is_ok());
-        let (_, addr) = result.unwrap();
-        println!("Public endpoint: {}", addr);
     }
 
     #[tokio::test]
