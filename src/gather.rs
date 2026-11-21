@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
+use crate::cancel::{Cancel, Cancelled};
 use crate::candidates::{
     detect_cgnat, interface_addrs, is_global_v6, local_candidates, mapped_candidate, primary_v4,
     Candidate, CandidateKind,
@@ -113,7 +114,10 @@ fn ordered_addrs(primary: Option<Ipv4Addr>, addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 
 /// Gathers everything: sockets, router mapping, STUN reflexive address and NAT
 /// type, local interface addresses and the CGNAT verdict.
-pub async fn gather() -> Result<Gathered> {
+///
+/// Ctrl-C ends it early with a [`Cancelled`] error. A router mapping that was
+/// already requested is released first, so nothing stays open on the router.
+pub async fn gather(cancel: &Cancel) -> Result<Gathered> {
     let primary = primary_v4();
     let addrs = ordered_addrs(primary, interface_addrs());
     let has_global_v6 = addrs
@@ -126,9 +130,18 @@ pub async fn gather() -> Result<Gathered> {
         None => None,
     };
 
-    let pm = PortMap::start(v4_port);
-    let ((stun_addr, nat), (probe, router_ext)) =
-        tokio::join!(stun::probe_nat(&sockets.v4), map_port(&pm));
+    // Nothing is open on the router yet, so there is nothing to release.
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
+
+    let (pm, ((stun_addr, nat), (probe, router_ext))) = guarded(
+        PortMap::start(v4_port),
+        cancel,
+        async |pm| tokio::join!(stun::probe_nat(&sockets.v4), map_port(pm)),
+        PortMap::close,
+    )
+    .await?;
 
     let mut candidates = local_candidates(&addrs, v4_port, v6_port);
     let ipv6_addr = candidates.iter().find_map(|c| match c.addr {
@@ -173,6 +186,24 @@ pub async fn gather() -> Result<Gathered> {
         stun_addr,
         ipv6_addr,
     })
+}
+
+/// Runs `work` with `resource`. If Ctrl-C comes first, `work` is dropped,
+/// `release` runs to the end and the result is [`Cancelled`]; otherwise the
+/// caller gets the resource back with the result and stays in charge of it.
+async fn guarded<P, T>(
+    resource: P,
+    cancel: &Cancel,
+    work: impl AsyncFnOnce(&P) -> T,
+    release: impl AsyncFnOnce(P),
+) -> Result<(P, T), Cancelled> {
+    match cancel.run(work(&resource)).await {
+        Ok(result) => Ok((resource, result)),
+        Err(cancelled) => {
+            release(resource).await;
+            Err(cancelled)
+        }
+    }
 }
 
 /// The probe got an answer and the router speaks none of the protocols, so no
@@ -276,5 +307,64 @@ mod tests {
             .map(|c| c.addr.ip())
             .collect();
         assert_eq!(lan, vec![ip("192.168.1.10"), ip("172.17.0.1")]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_releases_the_resource_before_reporting_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (tx, cancel) = Cancel::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&released);
+
+        let press = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(true).unwrap();
+        };
+        let guard = guarded(
+            "mapping",
+            &cancel,
+            async |_| std::future::pending::<()>().await,
+            async |resource| {
+                assert_eq!(resource, "mapping");
+                // Release takes a while, as `PortMap::close` does.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                flag.store(true, Ordering::SeqCst);
+            },
+        );
+        let (result, ()) = tokio::join!(guard, press);
+
+        assert!(result.is_err());
+        // The release ran to the end before `guarded` returned.
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn without_ctrl_c_the_resource_comes_back_for_the_caller() {
+        let (_tx, cancel) = Cancel::channel();
+        let (resource, result) = guarded(
+            "mapping",
+            &cancel,
+            async |r| r.len(),
+            async |_| panic!("nothing to release"),
+        )
+        .await
+        .unwrap();
+        assert_eq!((resource, result), ("mapping", 7));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_before_the_mapping_is_requested_just_returns() {
+        let (tx, cancel) = Cancel::channel();
+        tx.send(true).unwrap();
+        let started = std::time::Instant::now();
+        let err = gather(&cancel)
+            .await
+            .err()
+            .expect("gathering was cancelled");
+        assert!(err.is::<Cancelled>());
+        // No STUN round trips and no mapping to wait for.
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

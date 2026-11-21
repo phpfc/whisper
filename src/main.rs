@@ -1,3 +1,4 @@
+mod cancel;
 mod candidates;
 mod cli;
 mod code;
@@ -16,6 +17,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 
+use cancel::{Cancel, Cancelled};
 use candidates::{infer_kind, select_direct, Candidate};
 use cli::P2PChat;
 use code::SessionCode;
@@ -69,23 +71,30 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    // Before anything is opened on the router, so that Ctrl-C at any point
+    // can still release it (see `cancel`).
+    let cancel = Cancel::install().await;
+
+    let result = match cli.command {
         Commands::Create { username, password } => {
-            create_session(&username, non_empty(&password)).await?;
+            create_session(&username, non_empty(&password), &cancel).await
         }
         Commands::Join {
             code,
             username,
             password,
-        } => {
-            join_session(&code, &username, non_empty(&password)).await?;
-        }
-        Commands::Doctor => {
-            doctor::run().await?;
-        }
-    }
+        } => join_session(&code, &username, non_empty(&password), &cancel).await,
+        Commands::Doctor => doctor::run(&cancel).await,
+    };
 
-    Ok(())
+    match result {
+        // Whatever was open has been released by now.
+        Err(e) if e.is::<Cancelled>() => {
+            println!("\nCancelled.");
+            std::process::exit(130);
+        }
+        result => result,
+    }
 }
 
 /// An empty password is the same as none: both derive the same key.
@@ -98,9 +107,9 @@ fn check_username(username: &str) -> Result<()> {
 }
 
 /// Binds the sockets and learns how this machine can be reached.
-async fn gather_network() -> Result<Gathered> {
+async fn gather_network(cancel: &Cancel) -> Result<Gathered> {
     println!("Gathering network info...");
-    let gathered = gather().await?;
+    let gathered = gather(cancel).await?;
     if let Some(port) = gathered.mapped_port() {
         println!("UDP port {port} opened on your router (closed on exit)");
     }
@@ -113,9 +122,9 @@ fn closed_signal() -> mpsc::Receiver<PeerInfo> {
     rx
 }
 
-async fn create_session(username: &str, password: Option<&str>) -> Result<()> {
+async fn create_session(username: &str, password: Option<&str>, cancel: &Cancel) -> Result<()> {
     check_username(username)?;
-    let gathered = gather_network().await?;
+    let gathered = gather_network(cancel).await?;
 
     let secret = SessionSecret::generate();
     let code = SessionCode {
@@ -144,15 +153,21 @@ async fn create_session(username: &str, password: Option<&str>) -> Result<()> {
         SessionKeys::derive(&secret),
         vec![],
         closed_signal(),
+        cancel,
     )
     .await
 }
 
-async fn join_session(code: &str, username: &str, password: Option<&str>) -> Result<()> {
+async fn join_session(
+    code: &str,
+    username: &str,
+    password: Option<&str>,
+    cancel: &Cancel,
+) -> Result<()> {
     check_username(username)?;
     // A bad code fails right away, before anything is opened on the router.
     let code = SessionCode::decode(code)?;
-    let gathered = gather_network().await?;
+    let gathered = gather_network(cancel).await?;
 
     let initial_remote = code
         .direct
@@ -171,12 +186,15 @@ async fn join_session(code: &str, username: &str, password: Option<&str>) -> Res
         SessionKeys::derive(&code.secret),
         initial_remote,
         closed_signal(),
+        cancel,
     )
     .await
 }
 
 /// Connects to the peer, runs the chat and releases the router port on every
 /// way out.
+// One over the lint's limit; the signature is fixed by the plan, plus `cancel`.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     role: Role,
     username: &str,
@@ -185,6 +203,7 @@ async fn run_session(
     keys: SessionKeys,
     initial_remote: Vec<Candidate>,
     remote_rx: mpsc::Receiver<PeerInfo>,
+    cancel: &Cancel,
 ) -> Result<()> {
     let Gathered {
         sockets, portmap, ..
@@ -206,14 +225,13 @@ async fn run_session(
         Role::Joiner => println!("Connecting to your peer... (Ctrl-C to cancel)"),
     }
 
-    let connected = tokio::select! {
-        result = connect(sockets, args, remote_rx) => result,
-        // An `Err` here (no signal handler) disables this branch instead of
-        // cancelling a session nobody asked to cancel.
-        Ok(()) = tokio::signal::ctrl_c() => {
+    // A Ctrl-C that came earlier (while gathering, or during the Argon2 above)
+    // is seen at once.
+    let connected = match cancel.run(connect(sockets, args, remote_rx)).await {
+        Ok(connected) => connected,
+        Err(cancelled) => {
             close_portmap(portmap).await;
-            println!("\nCancelled.");
-            std::process::exit(130);
+            return Err(cancelled.into());
         }
     };
 

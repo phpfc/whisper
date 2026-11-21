@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
+use crate::cancel::Cancel;
 use crate::gather::{gather, NetSummary};
 use crate::portmap::ProbeFlags;
 use crate::signal::public_dht;
@@ -122,9 +123,10 @@ async fn check_dht() -> Option<Duration> {
     bootstrapped.then(|| start.elapsed())
 }
 
-/// Gathers network info, checks the DHT and prints the report.
-pub async fn run() -> Result<()> {
-    let mut g = gather().await?;
+/// Gathers network info, checks the DHT and prints the report. Ctrl-C ends it
+/// with a `Cancelled` error, after releasing any router mapping.
+pub async fn run(cancel: &Cancel) -> Result<()> {
+    let mut g = gather(cancel).await?;
 
     // The mapping is only needed to learn whether the router grants one, so
     // release it now rather than keeping it open during the DHT check.
@@ -138,7 +140,7 @@ pub async fn run() -> Result<()> {
         router_ext: g.router_ext.map(|a| *a.ip()),
         stun_ip: g.stun_ip(),
         summary: g.summary,
-        dht: check_dht().await,
+        dht: cancel.run(check_dht()).await?,
     };
     print!("{}", render(&report));
     Ok(())
