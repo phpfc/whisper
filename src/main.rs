@@ -1,9 +1,12 @@
 mod candidates;
 mod cli;
 mod crypto;
+mod doctor;
+mod gather;
 mod hole_punch;
 mod portmap;
 mod session;
+mod signal;
 mod stun;
 
 use anyhow::Result;
@@ -53,6 +56,9 @@ enum Commands {
         #[arg(short, long)]
         password: String,
     },
+
+    /// Check whether this network can host or join sessions
+    Doctor,
 }
 
 #[tokio::main]
@@ -69,6 +75,9 @@ async fn main() -> Result<()> {
             password,
         } => {
             join_session(&code, &username, &password).await?;
+        }
+        Commands::Doctor => {
+            doctor::run().await?;
         }
     }
 

@@ -71,6 +71,12 @@ impl PortMap {
         })
     }
 
+    /// Retries the mapping now that a probe has recorded which protocols the
+    /// router speaks (the crate's first attempt after `start` is UPnP-only).
+    pub fn procure(&self) {
+        self.client.procure_mapping();
+    }
+
     /// Releases the router mapping and waits (bounded by `CLOSE_TIMEOUT`) for
     /// the release request to be done.
     pub async fn close(self) {
@@ -120,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_barrier_is_answered_before_the_deadline() {
-        let pm = PortMap::start(40_123);
+        let pm = PortMap::start(40_124);
         pm.client.deactivate();
         let t = std::time::Instant::now();
         pm.wait_release_done(Instant::now() + CLOSE_TIMEOUT).await;
