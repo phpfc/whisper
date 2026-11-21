@@ -50,8 +50,8 @@ const RECV_BUF: usize = 2048;
 /// it can open, so the others cover for loss.
 const FINAL_PINGS: usize = 3;
 
-/// A joiner treats the creator's record as stale once it is older than the
-/// creator's wait plus this: the creator has given up by then.
+/// A joiner suspects the creator's record is stale once it is older than the
+/// creator's wait plus this: the creator has probably given up by then.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
 /// Windows fails a receive with WSAEMSGSIZE when the datagram is larger than
@@ -100,6 +100,9 @@ pub struct Timeouts {
     pub joiner_with_remote: Duration,
     /// The joiner gives up with `NoPath` after this long without any `PeerInfo`.
     pub joiner_without_remote: Duration,
+    /// After a stale `PeerInfo` the joiner gives up with `Expired` this long
+    /// later, unless a path answers first.
+    pub stale_grace: Duration,
 }
 
 impl Default for Timeouts {
@@ -112,6 +115,7 @@ impl Default for Timeouts {
             creator_wait: Duration::from_secs(600),
             joiner_with_remote: Duration::from_secs(45),
             joiner_without_remote: Duration::from_secs(60),
+            stale_grace: Duration::from_secs(10),
         }
     }
 }
@@ -141,7 +145,7 @@ pub enum ConnectError {
     NoOneJoined,
     WrongPassword,
     NoPath { remote: Option<NetSummary> },
-    // The creator published its candidates so long ago that it has given up.
+    // The creator's record is so old that it has given up, and no path answered.
     Expired,
     Io(io::Error),
 }
@@ -192,14 +196,14 @@ pub async fn connect(
                 checks.send_probes(Instant::now());
                 Ok(None)
             }
-            info = remote_rx.recv(), if rx_open => match info {
-                Some(info) => checks.add_peer_info(info, Instant::now(), unix_ms()).map(|()| None),
-                // Closed for good: stop polling it.
-                None => {
-                    rx_open = false;
-                    Ok(None)
+            info = remote_rx.recv(), if rx_open => {
+                match info {
+                    Some(info) => checks.add_peer_info(info, Instant::now(), unix_ms()),
+                    // Closed for good: stop polling it.
+                    None => rx_open = false,
                 }
-            },
+                Ok(None)
+            }
             _ = sleep_opt(checks.tiebreak_at) => checks.choose_path(Instant::now()).map(|()| None),
             _ = sleep_opt(checks.resend_at()) => {
                 checks.resend_hs1(Instant::now());
@@ -281,7 +285,10 @@ struct Checks<'a> {
     seen_probes: HashMap<[u8; 12], Instant>,
     /// Addresses that answered a probe of ours, in order of confirmation.
     confirmed: Vec<SocketAddr>,
+    /// Set from a fresh `PeerInfo`; a stale one leaves it alone.
     remote_summary: Option<NetSummary>,
+    /// The latest `PeerInfo` is older than the creator waits.
+    stale_remote: bool,
     deadline: Instant,
     tiebreak_at: Option<Instant>,
     dialing: Option<Dialing>,
@@ -312,6 +319,7 @@ impl<'a> Checks<'a> {
             seen_probes: HashMap::new(),
             confirmed: Vec::new(),
             remote_summary: None,
+            stale_remote: false,
             deadline: now + wait,
             tiebreak_at: None,
             dialing: None,
@@ -337,25 +345,28 @@ impl<'a> Checks<'a> {
         }
     }
 
-    /// The peer's candidates arrived. `now_ms` is the Unix time, to tell a
-    /// creator that published long ago and has given up since.
-    fn add_peer_info(
-        &mut self,
-        info: PeerInfo,
-        now: Instant,
-        now_ms: i64,
-    ) -> Result<(), ConnectError> {
+    /// The peer's candidates arrived. `now_ms` is the Unix time.
+    ///
+    /// A joiner that gets a record older than the creator waits only takes it
+    /// as a hint: the creator has probably given up, but our clock may be the
+    /// one that is off, so its candidates are still probed. The deadline moves
+    /// up to `stale_grace` from now (never later than it was), and a deadline
+    /// reached with nothing connected is then `Expired`. A fresh record
+    /// afterwards puts the normal deadline back.
+    fn add_peer_info(&mut self, info: PeerInfo, now: Instant, now_ms: i64) {
         if self.role == Role::Joiner && self.is_stale(info.published_ms, now_ms) {
-            return Err(ConnectError::Expired);
+            self.stale_remote = true;
+            self.deadline = self.deadline.min(now + self.t.stale_grace);
+        } else {
+            if self.remote_summary.is_none() {
+                self.deadline = now + self.t.joiner_with_remote;
+            }
+            self.stale_remote = false;
+            self.remote_summary = Some(info.summary);
         }
-        if self.remote_summary.is_none() {
-            self.deadline = now + self.t.joiner_with_remote;
-        }
-        self.remote_summary = Some(info.summary);
         for c in info.candidates {
             add_candidate(&mut self.remote, c);
         }
-        Ok(())
     }
 
     /// A record published at `published_ms` is older than the creator waits.
@@ -385,6 +396,8 @@ impl<'a> Checks<'a> {
         match (self.role, &self.remote_summary) {
             // A path answered; the peer never accepted our handshake.
             (Role::Joiner, _) if self.dialing.is_some() => ConnectError::WrongPassword,
+            // Only a stale record, and nothing answered.
+            (Role::Joiner, _) if self.stale_remote => ConnectError::Expired,
             (Role::Creator, None) => ConnectError::NoOneJoined,
             (_, remote) => ConnectError::NoPath {
                 remote: remote.clone(),
@@ -744,6 +757,7 @@ mod tests {
             creator_wait: ms(3000),
             joiner_with_remote: ms(2000),
             joiner_without_remote: ms(2000),
+            stale_grace: ms(500),
         };
         ConnectArgs {
             role,
@@ -1310,55 +1324,149 @@ mod tests {
         assert_eq!(text(ConnectError::Io(io::Error::other("boom"))), "boom");
     }
 
+    /// A record the creator published 12 min ago, with `candidates`.
+    fn stale_info(candidates: Vec<Candidate>) -> PeerInfo {
+        PeerInfo {
+            published_ms: unix_ms() - 12 * 60 * 1000,
+            ..info(candidates)
+        }
+    }
+
     #[tokio::test]
     async fn stale_creator_info_is_expired() {
         let keys = SessionKeys::derive(&SessionSecret([16; 16]));
         let (js, _) = loopback_sockets().await;
         let (tx, rx) = mpsc::channel(1);
-        // The creator published 12 min ago: it has given up by now.
-        let mut stale = info(vec![lan("127.0.0.1:9".parse().unwrap())]);
-        stale.published_ms = unix_ms() - 12 * 60 * 1000;
-        tx.send(stale).await.unwrap();
+        // The creator published 12 min ago and nothing answers its candidate.
+        tx.send(stale_info(vec![lan("127.0.0.1:9".parse().unwrap())]))
+            .await
+            .unwrap();
+        let mut a = args(Role::Joiner, &keys, [7; 32], "bob", vec![]);
+        a.timeouts.stale_grace = ms(500);
         let started = Instant::now();
-        let e = err(connect(js, args(Role::Joiner, &keys, [7; 32], "bob", vec![]), rx).await);
+        let e = err(connect(js, a, rx).await);
+        let elapsed = started.elapsed();
         assert!(matches!(e, ConnectError::Expired), "{e:?}");
+        // Not at once (the record is only a hint), and well before the 2 s of
+        // `joiner_with_remote`: after the grace.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+            elapsed >= ms(450) && elapsed < ms(500) + Duration::from_secs(1),
+            "{elapsed:?}"
         );
         drop(tx);
     }
 
+    #[tokio::test]
+    async fn stale_record_from_a_reachable_creator_still_connects() {
+        // The joiner's clock is far ahead of the creator's: its record looks
+        // old, but the creator is right there.
+        let keys = SessionKeys::derive(&SessionSecret([18; 16]));
+        let psk = derive_psk(&keys, "");
+        let (cs, caddr) = loopback_sockets().await;
+        let (js, _) = loopback_sockets().await;
+        let (tx, rx) = mpsc::channel(1);
+        let mut ja = args(Role::Joiner, &keys, psk, "bob", vec![]);
+        ja.timeouts.stale_grace = ms(1500);
+        let creator = connect(
+            cs,
+            args(Role::Creator, &keys, psk, "alice", vec![]),
+            closed_rx(),
+        );
+        let joiner = connect(js, ja, rx);
+        let feed = async {
+            tokio::time::sleep(ms(100)).await;
+            tx.send(stale_info(vec![lan(caddr)])).await.unwrap();
+        };
+        let (c, j, ()) = tokio::join!(creator, joiner, feed);
+        let (c, j) = (c.unwrap(), j.unwrap());
+        assert_eq!((j.peer, j.path), (caddr, CandidateKind::Lan));
+        assert_eq!(c.fingerprint, j.fingerprint);
+        assert_eq!(j.peer_username, "alice");
+    }
+
     #[test]
-    fn only_a_joiner_expires_on_old_peer_info() {
+    fn stale_info_shortens_the_deadline_until_a_fresh_one_arrives() {
         let keys = SessionKeys::derive(&SessionSecret([17; 16]));
-        let (now, now_ms) = (Instant::now(), 1_000_000_000_000_i64);
+        let (t0, now_ms) = (Instant::now(), 1_000_000_000_000_i64);
         let aged = |secs: i64| PeerInfo {
             published_ms: now_ms - secs * 1000,
+            ..info(vec![lan("10.0.0.7:5".parse().unwrap())])
+        };
+        let mut a = args(Role::Joiner, &keys, [7; 32], "bob", vec![]);
+        a.timeouts.stale_grace = ms(500);
+        // creator_wait + 60 s = 63 s: the limit is exclusive.
+        let mut joiner = Checks::new(&a, false, t0);
+        let normal = joiner.deadline;
+        joiner.add_peer_info(aged(63), t0 + ms(100), now_ms);
+        assert!(!joiner.stale_remote);
+        assert_eq!(
+            joiner.deadline,
+            t0 + ms(100) + a.timeouts.joiner_with_remote
+        );
+
+        // A record dated in the future (clock skew) is not old either.
+        let mut ahead = Checks::new(&a, false, t0);
+        ahead.add_peer_info(aged(-3600), t0, now_ms);
+        assert!(!ahead.stale_remote);
+
+        // A stale one only shortens the deadline, and keeps its candidates.
+        let mut joiner = Checks::new(&a, false, t0);
+        joiner.add_peer_info(aged(64), t0 + ms(100), now_ms);
+        assert!(joiner.stale_remote);
+        assert_eq!(joiner.deadline, t0 + ms(600));
+        assert_eq!(joiner.remote.len(), 1);
+        assert!(matches!(joiner.deadline_error(), ConnectError::Expired));
+
+        // Never later than the deadline it already had.
+        let mut late = Checks::new(&a, false, t0);
+        late.add_peer_info(aged(64), t0 + normal.duration_since(t0), now_ms);
+        assert_eq!(late.deadline, normal);
+
+        // A newer, fresh record clears the flag and the normal rule applies.
+        joiner.add_peer_info(aged(1), t0 + ms(200), now_ms);
+        assert!(!joiner.stale_remote);
+        assert_eq!(
+            joiner.deadline,
+            t0 + ms(200) + a.timeouts.joiner_with_remote
+        );
+        assert!(matches!(
+            joiner.deadline_error(),
+            ConnectError::NoPath { remote: Some(_) }
+        ));
+
+        // A handshake under way wins over the flag.
+        let mut dialing = Checks::new(&a, false, t0);
+        dialing.add_peer_info(aged(64), t0, now_ms);
+        dialing.confirm("10.0.0.7:5".parse().unwrap(), t0);
+        dialing.choose_path(t0).unwrap();
+        assert!(dialing.stale_remote);
+        assert!(matches!(
+            dialing.deadline_error(),
+            ConnectError::WrongPassword
+        ));
+        assert_eq!(
+            dialing.effective_deadline(),
+            t0 + a.timeouts.wrong_password_after
+        );
+    }
+
+    #[test]
+    fn a_creator_never_treats_a_record_as_stale() {
+        let keys = SessionKeys::derive(&SessionSecret([19; 16]));
+        let (t0, now_ms) = (Instant::now(), 1_000_000_000_000_i64);
+        let a = args(Role::Creator, &keys, [7; 32], "alice", vec![]);
+        let mut creator = Checks::new(&a, false, t0);
+        // The joiner left a record an hour ago: the creator takes it as is.
+        let old = PeerInfo {
+            published_ms: now_ms - 3600 * 1000,
             ..info(vec![])
         };
-        let mut joiner_args = args(Role::Joiner, &keys, [7; 32], "bob", vec![]);
-        // creator_wait + 60 s = 63 s: the limit is exclusive.
-        let mut joiner = Checks::new(&joiner_args, false, now);
-        assert!(joiner.add_peer_info(aged(63), now, now_ms).is_ok());
+        creator.add_peer_info(old, t0, now_ms);
+        assert!(!creator.stale_remote);
+        assert_eq!(creator.deadline, t0 + a.timeouts.joiner_with_remote);
         assert!(matches!(
-            joiner.add_peer_info(aged(64), now, now_ms),
-            Err(ConnectError::Expired)
+            creator.deadline_error(),
+            ConnectError::NoPath { remote: Some(_) }
         ));
-        // A record from the future (clock skew) is not old.
-        assert!(joiner.add_peer_info(aged(-3600), now, now_ms).is_ok());
-
-        // The expired record taught nothing: no summary, no new deadline.
-        let mut fresh = Checks::new(&joiner_args, false, now);
-        let first_deadline = fresh.deadline;
-        assert!(fresh.add_peer_info(aged(600), now + ms(5), now_ms).is_err());
-        assert!(fresh.remote_summary.is_none());
-        assert_eq!(fresh.deadline, first_deadline);
-
-        // The creator takes whatever the joiner left on the DHT.
-        joiner_args.role = Role::Creator;
-        let mut creator = Checks::new(&joiner_args, false, now);
-        assert!(creator.add_peer_info(aged(3600), now, now_ms).is_ok());
     }
 }
