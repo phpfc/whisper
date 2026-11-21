@@ -1,6 +1,7 @@
 mod candidates;
 mod cli;
 mod code;
+mod connect;
 mod crypto;
 mod doctor;
 mod gather;
