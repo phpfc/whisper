@@ -175,15 +175,32 @@ pub async fn gather() -> Result<Gathered> {
     })
 }
 
+/// The probe got an answer and the router speaks none of the protocols, so no
+/// mapping will ever appear. A probe that got no answer proves nothing.
+fn router_offers_nothing(probe: Option<ProbeFlags>) -> bool {
+    probe.is_some_and(|p| !(p.upnp || p.nat_pmp || p.pcp))
+}
+
+/// PCP and NAT-PMP are only used once a probe has recorded them (the crate's
+/// first attempt after `start` is UPnP-only), so the mapping must be retried.
+fn needs_procure(probe: Option<ProbeFlags>) -> bool {
+    probe.is_some_and(|p| p.pcp || p.nat_pmp)
+}
+
 /// Probes the router's port mapping protocols, then waits for the external
-/// address, all within `PORTMAP_WAIT`.
+/// address, all within `PORTMAP_WAIT`. Returns right away when the router
+/// offers no protocol.
 async fn map_port(pm: &PortMap) -> (Option<ProbeFlags>, Option<SocketAddrV4>) {
     let started = Instant::now();
     let probe = pm.probe(PROBE_WAIT).await;
-    // The first mapping attempt only uses UPnP; PCP and NAT-PMP are tried only
-    // once a probe has recorded them, so retry if the router speaks either.
-    let already_mapped = pm.wait_external(Duration::ZERO).await.is_some();
-    if !already_mapped && probe.is_some_and(|p| p.pcp || p.nat_pmp) {
+    let current = pm.wait_external(Duration::ZERO).await;
+    if current.is_some() {
+        return (probe, current);
+    }
+    if router_offers_nothing(probe) {
+        return (probe, None);
+    }
+    if needs_procure(probe) {
         pm.procure();
     }
     let ext = pm
@@ -195,6 +212,26 @@ async fn map_port(pm: &PortMap) -> (Option<ProbeFlags>, Option<SocketAddrV4>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_mapping_wait_depends_on_what_the_probe_found() {
+        let flags = |upnp, nat_pmp, pcp| Some(ProbeFlags { upnp, nat_pmp, pcp });
+
+        // No protocol at all: nothing to wait for.
+        assert!(router_offers_nothing(flags(false, false, false)));
+        // Any protocol, or no answer from the probe: keep waiting.
+        assert!(!router_offers_nothing(flags(true, false, false)));
+        assert!(!router_offers_nothing(flags(false, true, false)));
+        assert!(!router_offers_nothing(flags(false, false, true)));
+        assert!(!router_offers_nothing(None));
+
+        // Only PCP / NAT-PMP need the mapping retried after the probe.
+        assert!(needs_procure(flags(false, true, false)));
+        assert!(needs_procure(flags(false, false, true)));
+        assert!(!needs_procure(flags(true, false, false)));
+        assert!(!needs_procure(flags(false, false, false)));
+        assert!(!needs_procure(None));
+    }
 
     #[test]
     fn can_host_with_ipv6_or_mapping() {
