@@ -1,15 +1,19 @@
 # Whisper
 
-Secure P2P terminal chat. Zero config, no servers needed.
+Secure P2P terminal chat. One code, no servers, no network setup.
 
 ## Features
 
-- **True P2P**: Direct connection via UDP hole punching - no relay servers
-- **E2E Encrypted**: X25519 key exchange + ChaCha20-Poly1305
-- **Zero Config**: No router setup, no server deployment, just run it
-- **Ephemeral**: Messages exist only in transit, never stored
+- **Direct P2P**: your messages go straight to your peer over UDP, never through a relay
+- **E2E encrypted**: Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s`, keyed by the session code
+- **Zero infrastructure cost**: no server is run or paid for by this project. It only uses public STUN servers and the BitTorrent DHT
+- **Zero config**: no port forwarding, no server deployment. If your router supports it, whisper opens a port for you and tells you
+- **Ephemeral**: messages exist only in transit, never stored
 
 ## Installation
+
+> Releases up to 0.2.x predate the connection model described below, and their
+> session codes are not compatible with it. Both peers must run the same generation.
 
 ### Homebrew (macOS)
 ```bash
@@ -32,80 +36,173 @@ C:\whisper\whisper.exe --help
 cargo install --git https://github.com/phpfc/whisper
 ```
 
+Building needs Rust 1.89 or newer (`rustup update stable`).
+
 ## Usage
 
 ### Create a session
 ```bash
-whisper create -u alice -p mysecret
+whisper create -u alice
 ```
 
 Output:
 ```
-Discovering public endpoint via STUN...
-Your endpoint: 203.45.67.89:54321
+Gathering network info...
+UDP port 54321 opened on your router (closed on exit)
 
-Share this session code with your peer:
-203.45.67.89:54321#7kJ9xnYpQm#QgT98sXCthe3
+========================================
+SESSION CODE:
 
-Waiting for peer to connect...
+  BGUUsqBDHSSwBjzHNZzr6i2xDb9yxSvxnjDGK4BdxHpCWQQx3ne73PfHUZd121wEAcxyW
+
+Share this code with your peer.
+========================================
+
+Waiting for your peer to join... (Ctrl-C to cancel)
 ```
+
+The `UDP port ... opened` line only appears if your router granted a port. Send the code to
+your peer over any channel (WhatsApp, SMS, email). The creator waits up to 10 minutes.
 
 ### Join a session
 ```bash
-whisper join "203.45.67.89:54321#7kJ9xnYpQm#QgT98sXCthe3" -u bob -p mysecret
+whisper join "BGUUsqBDHSSwBjzHNZzr6i2xDb9yxSvxnjDGK4BdxHpCWQQx3ne73PfHUZd121wEAcxyW" -u bob
 ```
 
-That's it. You're chatting with E2E encryption.
+Once the connection is up, each side sees something like this:
+```
+Connected to alice via mapped
+Session fingerprint: 3F9A0C11 52B7E4D8 9A01C6F2 7D3E84B5 (should match your peer's)
+```
+
+`via` is the kind of path that worked (`lan`, `ipv6`, `mapped`, `reflexive` or
+`peer-reflexive`). Compare the fingerprint with your peer over another channel if
+you want to be sure nobody else is on the line. Press Esc or Ctrl-C to leave the chat.
+Messages are at most 1000 bytes.
+
+### Optional password
+
+The code already carries a 128-bit secret, so a password is optional. Use one as extra
+protection, for example if the code might be seen by someone else, and send it over a
+different channel. If one side uses a password, **both** must pass the same one:
+
+```bash
+whisper create -u alice -p mysecret
+whisper join "<code>" -u bob -p mysecret
+```
+
+A wrong password or a wrong code fails with `wrong password or invalid code`.
+
+### Check your network
+```bash
+whisper doctor
+```
+
+Tells you whether this network can host sessions or join them, without connecting to anyone.
+Example (addresses are masked):
+
+```
+Global IPv6:   yes (2804:14c:…)
+Router:        no port mapping protocol found
+CGNAT:         unknown
+NAT mapping:   endpoint-independent (good for hole punching)
+DHT:           reachable (3.5 s)
+Verdict:       can likely reach peers that have IPv6
+```
+
+| Line | Meaning |
+|------|---------|
+| Global IPv6 | This machine has a public IPv6 address (no NAT in the way) |
+| Router | Which of UPnP, NAT-PMP and PCP the router answers to; any of them lets whisper open a port |
+| CGNAT | Whether your ISP shares one public IPv4 address among many customers |
+| NAT mapping | `endpoint-independent` works for hole punching; `symmetric` generally does not |
+| DHT | Whether the BitTorrent DHT is reachable, and how long it took to bootstrap |
+| Verdict | One line: `can host sessions`, `can likely reach peers that have IPv6`, `cannot host; hole punching likely works` or `direct connections unlikely from this network` |
+
+If doctor opens a router port to test it, it closes it again before exiting. When a
+connection fails, the error message says what is wrong with each side and points here.
 
 ## How It Works
 
+Each peer gathers **candidates**, the addresses where it might be reached. Both peers then
+try every pair of candidates at once, in both directions, and the first path that completes
+the encrypted handshake becomes the chat. Nobody is "the server": whoever has a reachable
+address ends up being the one the other connects to. These are the ways it can connect, from
+simplest to most involved; whisper uses the first one that works:
+
+1. **LAN or IPv6.** Peers on the same network, or with public IPv6 addresses, connect with
+   no NAT in the way.
+2. **A port on your router.** whisper asks your router for a port through UPnP, NAT-PMP or
+   PCP and prints `UDP port N opened on your router (closed on exit)`. That address goes
+   inside the session code (along with your IPv6 and LAN addresses, if you have them), so
+   your peer can connect right away. The port is removed when you leave (Esc, Ctrl-C or
+   the end of the session). The router's lease is 2 hours, so if the process is killed the
+   mapping lingers until it expires, pointing at a closed port.
+3. **Hole punching through the DHT.** Each peer publishes its candidates as an encrypted
+   record on the public BitTorrent Mainline DHT, and reads the other's. Knowing where the
+   other is, both send packets at the same time, which opens a path through both NATs.
+4. **An explained failure.** If nothing works, the error says why for each side (CGNAT,
+   symmetric NAT, no IPv6...) instead of hanging or falling back to something broken.
+
 ```
-┌─────────┐                              ┌─────────┐
-│  Alice  │                              │   Bob   │
-└────┬────┘                              └────┬────┘
-     │ 1. STUN query                          │
-     ▼                                        ▼
-┌─────────┐                              ┌─────────┐
-│ Google  │                              │ Google  │
-│  STUN   │                              │  STUN   │
-└─────────┘                              └─────────┘
-     │ 2. Get public IP:port                  │
-     ▼                                        ▼
-┌─────────┐  3. Share code out-of-band   ┌─────────┐
-│  Alice  │ ◄──────────────────────────► │   Bob   │
-└────┬────┘                              └────┬────┘
-     │                                        │
-     │  4. UDP hole punch + key exchange      │
-     │◄══════════════════════════════════════►│
-     │       5. Encrypted P2P chat            │
-     └────────────────────────────────────────┘
+  Alice (creator)                                       Bob (joiner)
+  gather candidates                                     read code
+  open router port (maybe)                              gather candidates
+  show code ───────────── you send it ────────────────> try the code's addresses
+  publish record ──┐                                ┌── publish record
+                   └──────── BitTorrent DHT ────────┘
+  read Bob's record                                     read Alice's record
+        └── both probe every candidate every 200 ms ──┘
+              first path with a valid handshake = chat
 ```
 
-1. Both peers query STUN servers to discover their public IP:port
-2. Alice generates a session code containing her endpoint + session ID + salt
-3. Bob receives the code (via any channel - SMS, email, etc.)
-4. Both send UDP packets to punch through NAT, then exchange X25519 keys
-5. Direct encrypted chat begins
+Probes and the handshake are authenticated with keys derived from the code, so packets from
+anyone who does not have it are dropped without an answer. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the details and [SECURITY.md](SECURITY.md) for the
+threat model.
+
+### Windows firewall
+
+The first time you run whisper on Windows, the firewall asks whether to allow it. **Also
+tick "Public networks"**: Windows treats new networks as Public, and only Private is ticked
+by default. Without it, a peer cannot reach you directly through the address in the code, so
+the connection waits for the DHT round and can take up to about 20 seconds instead of a few.
+macOS and most Linux desktops need nothing.
+
+## What Third Parties See
+
+| Who | What they see |
+|-----|---------------|
+| STUN servers (Google, Cloudflare) | Your public IP address. Not the code, not your messages |
+| BitTorrent DHT nodes | An encrypted blob, plus the IP of whoever publishes or looks it up. Without the code the record cannot be found or read |
+| Your peer | Your public IP (any direct connection needs it), the other addresses you advertise (LAN, IPv6) and your username |
+| Your messages | Only you and your peer. No server, STUN server or DHT node ever sees them |
 
 ## Security
 
 | Component | Implementation |
 |-----------|---------------|
-| Key Exchange | X25519 ECDH |
-| Encryption | ChaCha20-Poly1305 |
-| Password KDF | Argon2id |
-| Nonce | Counter-based (no collision) |
+| Handshake | Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s` |
+| Pre-shared key | Derived from the code's 128-bit secret and Argon2id(password) |
+| Transport | ChaCha20-Poly1305 with explicit nonces and a 64-packet anti-replay window |
+| DHT records | ChaCha20-Poly1305, key derived from the code |
+| Probes | HMAC-tagged; unauthenticated packets get no reply |
 
-**What STUN servers see**: Your public IP (required for NAT traversal)
-**What STUN servers DON'T see**: Session codes, messages, passwords, keys
+More in [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- **Symmetric NAT**: ~15-20% of corporate/carrier-grade NAT won't work. The connection will fail explicitly.
-- **Both online**: Unlike relay-based chat, both peers must be online simultaneously.
-- **1-to-1 only**: Currently supports two participants per session.
-
-These are architectural tradeoffs for true P2P with zero infrastructure.
+- **Symmetric NAT on both sides**: if both peers are behind symmetric NAT, no direct path
+  exists, and without a relay they cannot connect. The error tells you so. Try another
+  network, such as Wi-Fi instead of mobile data.
+- **Codes expire**: the creator stops waiting after 10 minutes. A joiner using an old code
+  gets `This session code has expired. Ask your peer for a new one.` about 10 seconds
+  later.
+- **Both online**: both peers must be online at the same time.
+- **1-to-1 only**: two participants per session.
+- **Messages are at most 1000 bytes.**
+- **UDP only**: networks that block UDP cannot be used.
+- **Code format**: session codes changed and are not compatible with 0.2.
 
 ## License
 
