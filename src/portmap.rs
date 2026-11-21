@@ -8,9 +8,10 @@ use portmapper::Client;
 use std::net::SocketAddrV4;
 use std::num::NonZeroU16;
 use std::time::Duration;
+use tokio::time::{timeout_at, Instant};
 
-/// How long `close` waits for the router mapping to be dropped.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound for the whole of `close` (kept under 3 s).
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(2_500);
 
 /// Which port mapping protocols the router answered to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +24,9 @@ pub struct ProbeFlags {
 /// A router port mapping for one local UDP port.
 ///
 /// The mapping is requested in the background by `start` and released by
-/// `close` (or, best effort, when dropped).
+/// `close`. Callers must call `close().await` on every exit path: dropping
+/// only queues a release that the crate's background task is usually aborted
+/// before it can run.
 pub struct PortMap {
     client: Client,
 }
@@ -35,8 +38,9 @@ impl PortMap {
     pub fn start(local_port: u16) -> Self {
         let client = Client::default();
         if let Some(port) = NonZeroU16::new(local_port) {
+            // A new local port already starts the mapping attempt inside the
+            // crate, so no separate `procure_mapping()` (it would restart it).
             client.update_local_port(port);
-            client.procure_mapping();
         }
         Self { client }
     }
@@ -67,11 +71,30 @@ impl PortMap {
         })
     }
 
-    /// Releases the router mapping, waiting up to 2 seconds for it to go away.
+    /// Releases the router mapping and waits (bounded by `CLOSE_TIMEOUT`) for
+    /// the release request to be done.
     pub async fn close(self) {
-        self.client.deactivate();
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut rx = self.client.watch_external_address();
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, rx.wait_for(|addr| addr.is_none())).await;
+        let had_mapping = rx.borrow().is_some();
+        self.client.deactivate();
+        let _ = timeout_at(deadline, rx.wait_for(|addr| addr.is_none())).await;
+        if had_mapping {
+            self.wait_release_done(deadline).await;
+        }
+    }
+
+    /// Returns once the crate's service has finished releasing the mapping
+    /// (or at `deadline`).
+    ///
+    /// The watcher turns `None` *before* the release request is sent (UPnP
+    /// even awaits the router's HTTP reply), and dropping the `Client` aborts
+    /// the service, which would cancel that request and leave the port open
+    /// until its 2 h lease expires. The service handles messages one at a
+    /// time and awaits the release inline, so a probe queued after
+    /// `deactivate` is only answered once the release has finished.
+    async fn wait_release_done(&self, deadline: Instant) {
+        let _ = timeout_at(deadline, self.client.probe()).await;
     }
 }
 
@@ -93,5 +116,14 @@ mod tests {
         let t = std::time::Instant::now();
         pm.close().await;
         assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn release_barrier_is_answered_before_the_deadline() {
+        let pm = PortMap::start(40_123);
+        pm.client.deactivate();
+        let t = std::time::Instant::now();
+        pm.wait_release_done(Instant::now() + CLOSE_TIMEOUT).await;
+        assert!(t.elapsed() < CLOSE_TIMEOUT);
     }
 }
