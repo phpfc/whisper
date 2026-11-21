@@ -10,6 +10,7 @@ mod portmap;
 mod session;
 mod signal;
 mod stun;
+mod wire;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

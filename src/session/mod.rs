@@ -6,7 +6,7 @@ use subtle::ConstantTimeEq;
 
 /// Validation constants
 pub const MAX_USERNAME_LEN: usize = 32;
-pub const MAX_MESSAGE_LEN: usize = 4096;
+pub const MAX_MESSAGE_LEN: usize = 1000;
 
 /// Validates a username (1-32 chars, alphanumeric + underscore)
 pub fn validate_username(username: &str) -> Result<(), &'static str> {
