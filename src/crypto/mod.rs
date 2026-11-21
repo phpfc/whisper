@@ -383,6 +383,45 @@ mod tests {
     }
 
     #[test]
+    fn replay_window_remembers_seen_nonces_after_advancing() {
+        // avanço pequeno: o 5 já visto continua marcado
+        let mut w = ReplayWindow::new();
+        assert!(w.accept(5));
+        assert!(w.accept(6));
+        assert!(!w.accept(5));
+        assert!(!w.accept(6));
+
+        // avanço de 63: o bit mais antigo ainda cabe na janela
+        let mut w = ReplayWindow::new();
+        assert!(w.accept(0));
+        assert!(w.accept(63));
+        assert!(!w.accept(0));
+        assert!(!w.accept(63));
+
+        // vários avanços seguidos mantêm o histórico
+        let mut w = ReplayWindow::new();
+        for n in [3, 4, 7, 20, 21] {
+            assert!(w.accept(n));
+        }
+        for n in [3, 4, 7, 20, 21] {
+            assert!(!w.accept(n), "nonce {n} should be remembered");
+        }
+        assert!(w.accept(5)); // nunca visto, ainda dentro da janela
+    }
+
+    #[test]
+    fn replay_of_older_packet_after_newer_one_is_rejected() {
+        let ((ti, _), (tr, _)) = handshake([1; 32], [1; 32]).unwrap();
+        let (n5, ct5) = ti.seal(b"cinco").unwrap();
+        let (n6, ct6) = ti.seal(b"seis").unwrap();
+        assert!(tr.open(n5, &ct5).is_ok());
+        assert!(tr.open(n6, &ct6).is_ok());
+        // o nonce mais antigo já foi aceito antes de a janela avançar
+        assert!(tr.open(n5, &ct5).is_err());
+        assert!(tr.open(n6, &ct6).is_err());
+    }
+
+    #[test]
     fn forged_packet_does_not_burn_the_nonce() {
         let ((ti, _), (tr, _)) = handshake([1; 32], [1; 32]).unwrap();
         let (n, ct) = ti.seal(b"legit").unwrap();
