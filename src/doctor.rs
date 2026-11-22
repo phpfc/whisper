@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use crate::cancel::Cancel;
+use crate::connect::ConnectError;
 use crate::gather::{gather, NetSummary};
 use crate::portmap::ProbeFlags;
 use crate::signal::public_dht;
@@ -68,12 +69,60 @@ pub fn describe(s: &NetSummary) -> &'static str {
     }
 }
 
+/// Whether the DHT, the only way to find a peer the code has no address for,
+/// could be reached from this network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// Our DHT node bootstrapped, or it is not known yet.
+    Fine,
+    /// No DHT node answered, though a STUN server did: something filters the
+    /// DHT.
+    NoDht,
+    /// No DHT node and no STUN server answered: UDP looks blocked.
+    NoUdp,
+}
+
+/// `dht_bootstrapped` is `None` while the bootstrap check is still running;
+/// `stun_answered` says whether any STUN server gave us our address.
+pub fn reach(dht_bootstrapped: Option<bool>, stun_answered: bool) -> Reach {
+    match (dht_bootstrapped, stun_answered) {
+        (Some(false), true) => Reach::NoDht,
+        (Some(false), false) => Reach::NoUdp,
+        _ => Reach::Fine,
+    }
+}
+
+/// What is wrong with the DHT, as the start of a sentence; `None` if nothing.
+fn reach_note(reach: Reach) -> Option<&'static str> {
+    match reach {
+        Reach::Fine => None,
+        Reach::NoDht => Some("The DHT is unreachable from this network"),
+        Reach::NoUdp => {
+            Some("This network seems to block UDP (no STUN server or DHT node answered)")
+        }
+    }
+}
+
+/// Why nobody joined the creator's session, for the user.
+pub fn explain_no_one_joined(reach: Reach) -> String {
+    match reach_note(reach) {
+        None => ConnectError::NoOneJoined.to_string(),
+        Some(note) => format!(
+            "No one joined within 10 minutes. {note}, so your peer may not have been able to find you. Try another network or run `whisper doctor`."
+        ),
+    }
+}
+
 /// Why the connection failed, for the user. `remote` is `None` when the other
-/// peer's candidates never arrived.
-pub fn explain_no_path(own: &NetSummary, remote: Option<&NetSummary>) -> String {
-    match remote {
-        None => "The other peer never showed up. Check that the code is complete and that they are still waiting, or run `whisper doctor`.".to_string(),
-        Some(remote) => format!(
+/// peer's candidates never arrived, and `reach` then says whether the DHT
+/// that should have brought them was reachable.
+pub fn explain_no_path(own: &NetSummary, remote: Option<&NetSummary>, reach: Reach) -> String {
+    match (remote, reach_note(reach)) {
+        (None, Some(note)) => format!(
+            "The other peer could not be reached. {note}, so only the addresses in the code could be tried. Try another network or run `whisper doctor`."
+        ),
+        (None, None) => "The other peer never showed up. Check that the code is complete and that they are still waiting, or run `whisper doctor`.".to_string(),
+        (Some(remote), _) => format!(
             "No direct path. You: {}. Other peer: {}. Try another network (Wi-Fi instead of mobile data) or run `whisper doctor`.",
             describe(own),
             describe(remote)
@@ -339,12 +388,49 @@ Verdict:       direct connections unlikely from this network
         use NatMapping::*;
         let own = s(false, false, Some(true), EndpointDependent);
         assert_eq!(
-            explain_no_path(&own, None),
+            explain_no_path(&own, None, Reach::Fine),
             "The other peer never showed up. Check that the code is complete and that they are still waiting, or run `whisper doctor`."
         );
+        let other = s(false, false, None, Unknown);
+        let no_path = "No direct path. You: symmetric NAT behind CGNAT. Other peer: cannot host (no IPv6, no port mapping). Try another network (Wi-Fi instead of mobile data) or run `whisper doctor`.";
+        // The peer's record arrived, so the DHT worked whatever the check said.
+        for reach in [Reach::Fine, Reach::NoDht, Reach::NoUdp] {
+            assert_eq!(explain_no_path(&own, Some(&other), reach), no_path);
+        }
+    }
+
+    #[test]
+    fn a_dht_out_of_reach_is_told_apart_from_blocked_udp() {
+        assert_eq!(reach(Some(true), true), Reach::Fine);
+        assert_eq!(reach(Some(true), false), Reach::Fine);
+        // Not known yet: no claim either way.
+        assert_eq!(reach(None, false), Reach::Fine);
+        assert_eq!(reach(Some(false), true), Reach::NoDht);
+        assert_eq!(reach(Some(false), false), Reach::NoUdp);
+    }
+
+    #[test]
+    fn explains_an_unreachable_dht() {
+        let own = s(false, false, None, NatMapping::EndpointIndependent);
         assert_eq!(
-            explain_no_path(&own, Some(&s(false, false, None, Unknown))),
-            "No direct path. You: symmetric NAT behind CGNAT. Other peer: cannot host (no IPv6, no port mapping). Try another network (Wi-Fi instead of mobile data) or run `whisper doctor`."
+            explain_no_path(&own, None, Reach::NoDht),
+            "The other peer could not be reached. The DHT is unreachable from this network, so only the addresses in the code could be tried. Try another network or run `whisper doctor`."
+        );
+        assert_eq!(
+            explain_no_path(&own, None, Reach::NoUdp),
+            "The other peer could not be reached. This network seems to block UDP (no STUN server or DHT node answered), so only the addresses in the code could be tried. Try another network or run `whisper doctor`."
+        );
+        assert_eq!(
+            explain_no_one_joined(Reach::Fine),
+            "No one joined within 10 minutes. Create a new session to try again."
+        );
+        assert_eq!(
+            explain_no_one_joined(Reach::NoDht),
+            "No one joined within 10 minutes. The DHT is unreachable from this network, so your peer may not have been able to find you. Try another network or run `whisper doctor`."
+        );
+        assert_eq!(
+            explain_no_one_joined(Reach::NoUdp),
+            "No one joined within 10 minutes. This network seems to block UDP (no STUN server or DHT node answered), so your peer may not have been able to find you. Try another network or run `whisper doctor`."
         );
     }
 }

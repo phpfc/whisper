@@ -51,6 +51,13 @@ pub fn public_dht() -> std::io::Result<AsyncDht> {
     Ok(builder.build()?.as_async())
 }
 
+/// How long `dht` took to bootstrap, if it did within `limit`.
+pub async fn bootstrap_time(dht: &AsyncDht, limit: Duration) -> Option<Duration> {
+    let start = std::time::Instant::now();
+    let bootstrapped = tokio::time::timeout(limit, dht.bootstrapped()).await.ok()?;
+    bootstrapped.then(|| start.elapsed())
+}
+
 /// The settings of a DHT client node: it bootstraps from `bootstrap`, or from
 /// the default public nodes when that is `None`.
 fn dht_builder(bootstrap: Option<&[String]>) -> mainline::DhtBuilder {
@@ -402,6 +409,26 @@ mod tests {
             known.iter().all(|n| n.address().ip().is_loopback()),
             "{known:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_time_tells_a_reachable_dht_from_an_empty_one() {
+        let testnet = mainline::Testnet::builder(5).build().unwrap();
+        let limit = Duration::from_secs(10);
+        let joined = testnet_dht(&testnet);
+        assert!(bootstrap_time(&joined, limit).await.is_some());
+
+        // Nobody to ask: it never bootstraps, and the limit is not waited out.
+        let alone = mainline::Dht::builder()
+            .no_bootstrap()
+            .bind_address(std::net::Ipv4Addr::LOCALHOST)
+            .port(0)
+            .build()
+            .unwrap()
+            .as_async();
+        let started = Instant::now();
+        assert_eq!(bootstrap_time(&alone, limit).await, None);
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
     }
 
     #[tokio::test]

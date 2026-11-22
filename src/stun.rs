@@ -26,6 +26,11 @@ pub const STUN_SERVERS: &[&str] = &[
 /// How long `probe_nat` waits for each server.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long `probe_nat` takes at most, name lookups included. On a network
+/// that drops UDP no server answers, and asking each in turn for
+/// `PROBE_TIMEOUT` would hold everything up for about 20 s.
+const PROBE_TOTAL: Duration = Duration::from_secs(6);
+
 /// How the NAT maps our local port when talking to different destinations.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NatMapping {
@@ -232,24 +237,30 @@ pub fn stun_servers() -> Vec<String> {
 /// Discovers our public address through `socket` and whether the NAT keeps the
 /// same mapping across destinations, asking the servers from [`stun_servers`].
 pub async fn probe_nat(socket: &tokio::net::UdpSocket) -> (Option<SocketAddr>, NatMapping) {
-    probe_nat_with(socket, &stun_servers(), PROBE_TIMEOUT).await
+    probe_nat_with(socket, &stun_servers(), PROBE_TIMEOUT, PROBE_TOTAL).await
 }
 
-/// [`probe_nat`] against an explicit list, waiting `timeout` for each server.
-/// The first two servers are asked, in sequence:
+/// [`probe_nat`] against an explicit list, waiting `timeout` for each server
+/// and `total` for everything. The first two servers are asked, in sequence:
 ///
 /// - Both answered: `(Some(first), classify_mapping(first, second))`.
 /// - Only one answered: `(Some(it), Unknown)`.
 /// - Neither answered: the rest of the list is tried just to learn our address
 ///   (`(Some(addr), Unknown)`), else `(None, Unknown)`.
+///
+/// A server still being asked when `total` runs out counts as silent; the
+/// answers already in are kept.
 pub async fn probe_nat_with<S: AsRef<str>>(
     socket: &tokio::net::UdpSocket,
     servers: &[S],
     timeout: Duration,
+    total: Duration,
 ) -> (Option<SocketAddr>, NatMapping) {
-    let ask = async |server: Option<&S>| match server {
-        Some(server) => query_by_name(socket, server.as_ref(), timeout).await,
-        None => None,
+    let deadline = tokio::time::Instant::now() + total;
+    let ask = async |server: Option<&S>| {
+        let server = server?;
+        let query = query_by_name(socket, server.as_ref(), timeout);
+        tokio::time::timeout_at(deadline, query).await.ok()?
     };
     let first = ask(servers.first()).await;
     let second = ask(servers.get(1)).await;
@@ -259,7 +270,7 @@ pub async fn probe_nat_with<S: AsRef<str>>(
         (Some(addr), None) | (None, Some(addr)) => (Some(addr), NatMapping::Unknown),
         (None, None) => {
             for server in servers.iter().skip(2) {
-                if let Some(addr) = query_by_name(socket, server.as_ref(), timeout).await {
+                if let Some(addr) = ask(Some(server)).await {
                     return (Some(addr), NatMapping::Unknown);
                 }
             }
@@ -403,6 +414,8 @@ mod tests {
     }
 
     const SHORT: Duration = Duration::from_millis(150);
+    /// An overall limit that never kicks in.
+    const LONG: Duration = Duration::from_secs(30);
 
     /// A server that receives and never answers; keep the socket alive so the
     /// sender gets no ICMP error either.
@@ -420,7 +433,7 @@ mod tests {
     async fn two_servers_with_one_mapping_are_endpoint_independent() {
         let r = spawn_responder().await.to_string();
         let client = loopback_client().await;
-        let (addr, mapping) = probe_nat_with(&client, &[&r, &r], SHORT).await;
+        let (addr, mapping) = probe_nat_with(&client, &[&r, &r], SHORT, LONG).await;
         assert_eq!(addr, Some(client.local_addr().unwrap()));
         assert_eq!(mapping, NatMapping::EndpointIndependent);
     }
@@ -432,11 +445,11 @@ mod tests {
         let client = loopback_client().await;
         let local = Some(client.local_addr().unwrap());
 
-        let answered_second = probe_nat_with(&client, &[&silent, &r], SHORT).await;
+        let answered_second = probe_nat_with(&client, &[&silent, &r], SHORT, LONG).await;
         assert_eq!(answered_second, (local, NatMapping::Unknown));
-        let answered_first = probe_nat_with(&client, &[&r, &silent], SHORT).await;
+        let answered_first = probe_nat_with(&client, &[&r, &silent], SHORT, LONG).await;
         assert_eq!(answered_first, (local, NatMapping::Unknown));
-        let only_one = probe_nat_with(&client, &[&r], SHORT).await;
+        let only_one = probe_nat_with(&client, &[&r], SHORT, LONG).await;
         assert_eq!(only_one, (local, NatMapping::Unknown));
     }
 
@@ -446,15 +459,65 @@ mod tests {
         let (_keep, silent) = silent_server().await;
         let client = loopback_client().await;
 
-        let result = probe_nat_with(&client, &[&silent, &silent, &r], SHORT).await;
+        let result = probe_nat_with(&client, &[&silent, &silent, &r], SHORT, LONG).await;
         assert_eq!(
             result,
             (Some(client.local_addr().unwrap()), NatMapping::Unknown)
         );
-        let nobody = probe_nat_with(&client, &[&silent, &silent], SHORT).await;
+        let nobody = probe_nat_with(&client, &[&silent, &silent], SHORT, LONG).await;
         assert_eq!(nobody, (None, NatMapping::Unknown));
         let empty: [&str; 0] = [];
-        assert_eq!(probe_nat_with(&client, &empty, SHORT).await, (None, NatMapping::Unknown));
+        assert_eq!(
+            probe_nat_with(&client, &empty, SHORT, LONG).await,
+            (None, NatMapping::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_whole_probe_stops_at_its_overall_limit() {
+        let (_k1, s1) = silent_server().await;
+        let (_k2, s2) = silent_server().await;
+        let (_k3, s3) = silent_server().await;
+        let client = loopback_client().await;
+        let started = std::time::Instant::now();
+        // 3 x 400 ms one server after the other, but only 300 ms in all.
+        let result = probe_nat_with(
+            &client,
+            &[&s1, &s2, &s3],
+            Duration::from_millis(400),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, (None, NatMapping::Unknown));
+        assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_before_the_overall_limit_is_kept() {
+        let r = spawn_responder().await.to_string();
+        let (_keep, silent) = silent_server().await;
+        let client = loopback_client().await;
+        let started = std::time::Instant::now();
+        // The silent second server only gets what is left of the 200 ms.
+        let result = probe_nat_with(
+            &client,
+            &[&r, &silent],
+            Duration::from_millis(1000),
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result,
+            (Some(client.local_addr().unwrap()), NatMapping::Unknown)
+        );
+        assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
+    }
+
+    #[test]
+    fn probing_takes_about_six_seconds_at_most() {
+        assert_eq!(PROBE_TOTAL, Duration::from_secs(6));
     }
 
     /// Starts a STUN responder on a loopback port that answers every request
