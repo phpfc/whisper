@@ -1,6 +1,6 @@
 [package]
 name = "whisper"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A simple, secure, and private P2P chat CLI with E2E encryption. Zero config required."
 license = "MIT"
