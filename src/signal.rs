@@ -47,17 +47,18 @@ pub const DHT_BOOTSTRAP_ENV: &str = "WHISPER_DHT_BOOTSTRAP";
 /// Starts a DHT client node that bootstraps from the nodes in
 /// `WHISPER_DHT_BOOTSTRAP` if it names any, else from the default public ones.
 pub fn public_dht() -> std::io::Result<AsyncDht> {
-    dht_node(list_from_env(DHT_BOOTSTRAP_ENV).as_deref())
+    let builder = dht_builder(list_from_env(DHT_BOOTSTRAP_ENV).as_deref());
+    Ok(builder.build()?.as_async())
 }
 
-/// A DHT client node that bootstraps from `bootstrap`, or from the default
-/// public nodes when that is `None`.
-fn dht_node(bootstrap: Option<&[String]>) -> std::io::Result<AsyncDht> {
+/// The settings of a DHT client node: it bootstraps from `bootstrap`, or from
+/// the default public nodes when that is `None`.
+fn dht_builder(bootstrap: Option<&[String]>) -> mainline::DhtBuilder {
     let mut builder = mainline::Dht::builder();
     if let Some(nodes) = bootstrap {
         builder.bootstrap(nodes);
     }
-    Ok(builder.build()?.as_async())
+    builder
 }
 
 fn salt(role: Role) -> &'static [u8] {
@@ -366,16 +367,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dht_node_bootstraps_from_the_given_list_only() {
+    async fn dht_builder_bootstraps_from_the_given_list_only() {
         let testnet = mainline::Testnet::builder(5).build().unwrap();
-        let node = dht_node(Some(&testnet.bootstrap)).unwrap();
-        assert!(node.bootstrapped().await);
-        // Everything it learned of is on the private network: none of the
+        // Bound like `testnet_dht`, and to a port the OS picks. Left on the
+        // defaults the node binds 0.0.0.0:6881, and on Windows that succeeds
+        // next to the testnet's first node on 127.0.0.1:6881 (Linux and macOS
+        // refuse it): every answer sent to 127.0.0.1:6881 then goes to that
+        // testnet node, none to ours.
+        let node = dht_builder(Some(&testnet.bootstrap))
+            .bind_address(std::net::Ipv4Addr::LOCALHOST)
+            .port(0)
+            .build()
+            .unwrap()
+            .as_async();
+
+        // Ask for our own id, as `bootstrapped()` does, until the node knows
+        // someone: one query on a busy CI machine is not a verdict.
+        let known = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let id = *node.info().await.id();
+                let nodes = node.find_node(id).await;
+                if !nodes.is_empty() {
+                    return nodes;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("the node never found anyone on the private network");
+
+        // Everyone it learned of is on the private network: none of the
         // default public nodes was asked.
-        let known = node.to_bootstrap().await;
-        assert!(!known.is_empty());
         assert!(
-            known.iter().all(|n| n.starts_with("127.0.0.1:")),
+            known.iter().all(|n| n.address().ip().is_loopback()),
             "{known:?}"
         );
     }
