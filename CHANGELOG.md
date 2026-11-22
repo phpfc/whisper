@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-22
 
 ### Added
 - Session code v3: `base58(3 || secret[16] || direct addresses || checksum)`, a 128-bit
@@ -70,3 +70,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NOT recommended for adversarial environments without implementing security improvements
 
 [0.1.0]: https://github.com/phpfc/t-chat/releases/tag/v0.1.0
+[0.3.0]: https://github.com/phpfc/whisper/releases/tag/v0.3.0

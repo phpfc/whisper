@@ -12,8 +12,8 @@ Secure P2P terminal chat. One code, no servers, no network setup.
 
 ## Installation
 
-> Releases up to 0.2.x predate the connection model described below, and their
-> session codes are not compatible with it. Both peers must run the same generation.
+> Use 0.3.0 or newer on both sides. Releases up to 0.2.x predate the connection
+> model described below, and their session codes are not compatible with it.
 
 ### Homebrew (macOS)
 ```bash
@@ -26,9 +26,9 @@ Download from [Releases](https://github.com/phpfc/whisper/releases), extract, an
 
 Or via PowerShell:
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/phpfc/whisper/releases/download/v0.2.1/whisper-0.2.1-x86_64-pc-windows-msvc.zip" -OutFile whisper.zip
-Expand-Archive whisper.zip -DestinationPath C:\whisper
-C:\whisper\whisper.exe --help
+Invoke-WebRequest -Uri "https://github.com/phpfc/whisper/releases/download/v0.3.0/whisper-0.3.0-x86_64-pc-windows-msvc.zip" -OutFile whisper.zip
+Expand-Archive whisper.zip -DestinationPath C:\whisper -Force
+C:\whisper\whisper.exe doctor
 ```
 
 ### Build from Source
