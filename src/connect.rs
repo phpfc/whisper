@@ -18,7 +18,7 @@
 //! without a reply, so junk hitting the session port never triggers traffic.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -36,13 +36,46 @@ use crate::session::validate_username;
 use crate::util::is_transient;
 use crate::wire::{probe, probe_ack, verify, ChatPayload, Packet, MAX_DATAGRAM};
 
-/// Probe transaction ids, ours waiting for a `ProbeAck` and the peer's already
-/// answered, are forgotten after this.
+/// Our probes still waiting for a `ProbeAck` are forgotten after this.
 const TXID_TTL: Duration = Duration::from_secs(5);
+
+/// Lengths an NNpsk0 message 1 can have: the ephemeral key (32), then the
+/// encrypted username (at most 32) and its tag (16).
+const HS1_LEN: std::ops::RangeInclusive<usize> = 48..=80;
 
 /// At most this many peer-reflexive candidates are learned. A replayed probe
 /// with a spoofed source must not turn us into a prober of arbitrary hosts.
 const MAX_PEER_REFLEXIVE: usize = 4;
+
+/// At most this many candidates are taken from the code and the peer's
+/// records together; later ones are ignored.
+const MAX_SIGNALED: usize = 16;
+
+/// How many txids of received probes are remembered.
+const SEEN_PROBES: usize = 4096;
+
+/// The txids of the last [`SEEN_PROBES`] valid probes received.
+#[derive(Default)]
+struct SeenTxids {
+    set: HashSet<[u8; 12]>,
+    order: VecDeque<[u8; 12]>,
+}
+
+impl SeenTxids {
+    /// Remembers `txid`. False if it is already remembered.
+    fn insert(&mut self, txid: [u8; 12]) -> bool {
+        if !self.set.insert(txid) {
+            return false;
+        }
+        self.order.push_back(txid);
+        if self.order.len() > SEEN_PROBES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+}
 
 /// Receive buffer size, above anything we send: a bigger datagram is junk.
 const RECV_BUF: usize = 2048;
@@ -91,7 +124,10 @@ pub struct Timeouts {
     pub wrong_password_after: Duration,
     /// The creator gives up with `NoOneJoined` after this long.
     pub creator_wait: Duration,
-    /// Either side gives up with `NoPath` this long after the first `PeerInfo`.
+    /// The joiner gives up with `NoPath` this long after the first `PeerInfo`.
+    /// The creator does so this long after each newer one, unless something
+    /// from the joiner got through: then a path exists, and it waits out
+    /// `creator_wait` for a joiner that completes the handshake.
     pub joiner_with_remote: Duration,
     /// The joiner gives up with `NoPath` after this long without any `PeerInfo`.
     pub joiner_without_remote: Duration,
@@ -273,11 +309,15 @@ struct Checks<'a> {
     t: Timeouts,
     has_v6: bool,
     remote: Vec<Candidate>,
+    /// Entries of `remote` that came from the code or a `PeerInfo`.
+    signaled: usize,
+    /// Entries of `remote` learned from the source of a probe.
+    learned: usize,
     /// Probes sent: txid -> (destination, when).
     pending: HashMap<[u8; 12], (SocketAddr, Instant)>,
-    /// Valid probes received: txid -> last seen. A replay is still answered
-    /// but teaches no new address.
-    seen_probes: HashMap<[u8; 12], Instant>,
+    /// Valid probes received, for the whole connect phase. A replay is still
+    /// answered but teaches no new address.
+    seen_probes: SeenTxids,
     /// Addresses that answered a probe of ours, in order of confirmation.
     confirmed: Vec<SocketAddr>,
     /// Set from a fresh `PeerInfo`; a stale one leaves it alone.
@@ -285,6 +325,11 @@ struct Checks<'a> {
     /// The latest `PeerInfo` is older than the creator waits.
     stale_remote: bool,
     deadline: Instant,
+    /// Creator: the end of its wait for someone to join.
+    wait_until: Instant,
+    /// Creator: an authenticated probe or a failed `Hs1` came in, so a path
+    /// exists and a `NoPath` deadline no longer applies.
+    peer_heard: bool,
     tiebreak_at: Option<Instant>,
     dialing: Option<Dialing>,
     answered: Option<Answered>,
@@ -294,41 +339,61 @@ struct Checks<'a> {
 
 impl<'a> Checks<'a> {
     fn new(args: &ConnectArgs<'a>, has_v6: bool, now: Instant) -> Self {
-        let mut remote = Vec::new();
-        for c in &args.initial_remote {
-            add_candidate(&mut remote, *c);
-        }
         let wait = match args.role {
             Role::Creator => args.timeouts.creator_wait,
             Role::Joiner => args.timeouts.joiner_without_remote,
         };
-        Self {
+        let mut checks = Self {
             role: args.role,
             probe_key: args.keys.probe_key,
             psk: args.psk,
             username: args.username,
             t: args.timeouts,
             has_v6,
-            remote,
+            remote: Vec::new(),
+            signaled: 0,
+            learned: 0,
             pending: HashMap::new(),
-            seen_probes: HashMap::new(),
+            seen_probes: SeenTxids::default(),
             confirmed: Vec::new(),
             remote_summary: None,
             stale_remote: false,
             deadline: now + wait,
+            wait_until: now + wait,
+            peer_heard: false,
             tiebreak_at: None,
             dialing: None,
             answered: None,
             warned: false,
             outbox: Vec::new(),
+        };
+        for c in &args.initial_remote {
+            checks.add_signaled(*c);
+        }
+        checks
+    }
+
+    /// A candidate from the code or a `PeerInfo`. New addresses past
+    /// [`MAX_SIGNALED`] are ignored; a known one can still get a better kind.
+    fn add_signaled(&mut self, c: Candidate) {
+        let known = self.remote.iter().any(|k| k.addr == c.addr);
+        if (known || self.signaled < MAX_SIGNALED) && add_candidate(&mut self.remote, c) {
+            self.signaled += 1;
+        }
+    }
+
+    /// Creator: something from the peer got through, so a path exists. The
+    /// peer may just retry (with the right password, say): wait for it.
+    fn heard_peer(&mut self) {
+        if self.role == Role::Creator && !self.peer_heard {
+            self.peer_heard = true;
+            self.deadline = self.deadline.max(self.wait_until);
         }
     }
 
     fn send_probes(&mut self, now: Instant) {
         self.pending
             .retain(|_, (_, sent)| now.duration_since(*sent) < TXID_TTL);
-        self.seen_probes
-            .retain(|_, seen| now.duration_since(*seen) < TXID_TTL);
         for c in &self.remote {
             if c.addr.is_ipv6() && !self.has_v6 {
                 continue;
@@ -348,19 +413,29 @@ impl<'a> Checks<'a> {
     /// up to `stale_grace` from now (never later than it was), and a deadline
     /// reached with nothing connected is then `Expired`. A fresh record
     /// afterwards puts the normal deadline back.
+    ///
+    /// A creator gives each newer record `joiner_with_remote` to get through
+    /// (a new record is a new attempt), and never less than its full wait
+    /// once it has heard from the peer.
     fn add_peer_info(&mut self, info: PeerInfo, now: Instant, now_ms: i64) {
+        let with_remote = now + self.t.joiner_with_remote;
         if self.role == Role::Joiner && self.is_stale(info.published_ms, now_ms) {
             self.stale_remote = true;
             self.deadline = self.deadline.min(now + self.t.stale_grace);
         } else {
-            if self.remote_summary.is_none() {
-                self.deadline = now + self.t.joiner_with_remote;
+            match self.role {
+                Role::Creator if self.peer_heard => {
+                    self.deadline = with_remote.max(self.wait_until);
+                }
+                Role::Creator => self.deadline = with_remote,
+                Role::Joiner if self.remote_summary.is_none() => self.deadline = with_remote,
+                Role::Joiner => {}
             }
             self.stale_remote = false;
             self.remote_summary = Some(info.summary);
         }
         for c in info.candidates {
-            add_candidate(&mut self.remote, c);
+            self.add_signaled(c);
         }
     }
 
@@ -393,6 +468,8 @@ impl<'a> Checks<'a> {
             (Role::Joiner, _) if self.dialing.is_some() => ConnectError::WrongPassword,
             // Only a stale record, and nothing answered.
             (Role::Joiner, _) if self.stale_remote => ConnectError::Expired,
+            // A path existed, but nobody completed the handshake on it.
+            (Role::Creator, _) if self.peer_heard => ConnectError::NoOneJoined,
             (Role::Creator, None) => ConnectError::NoOneJoined,
             (_, remote) => ConnectError::NoPath {
                 remote: remote.clone(),
@@ -429,19 +506,24 @@ impl<'a> Checks<'a> {
             return Ok(None);
         };
         match packet {
-            Packet::Probe { txid, .. } if verify(&self.probe_key, &packet) => {
+            // A source that cannot be a peer (port 0, broadcast, ...) gets
+            // nothing back.
+            Packet::Probe { txid, .. } if usable(src) && verify(&self.probe_key, &packet) => {
                 // One answer per probe, replay or not: never more traffic out
-                // than in. Only a fresh txid may teach us its source.
+                // than in. Only a txid never seen before may teach us its
+                // source.
                 self.outbox
                     .push((src, probe_ack(&self.probe_key, txid).encode()));
-                if self.seen_probes.insert(txid, now).is_none() {
+                if self.seen_probes.insert(txid) {
                     self.learn(src);
                 }
+                self.heard_peer();
             }
             Packet::ProbeAck { txid, .. } if verify(&self.probe_key, &packet) => {
                 if self.pending.remove(&txid).is_some() {
                     self.confirm(src, now);
                 }
+                self.heard_peer();
             }
             Packet::Hs1(body) if self.role == Role::Creator => self.answer(src, body, now)?,
             Packet::Hs2(body) if self.role == Role::Joiner => return self.finish(src, body),
@@ -460,14 +542,10 @@ impl<'a> Checks<'a> {
         if self.remote.iter().any(|c| c.addr == src) {
             return true;
         }
-        let learned = self
-            .remote
-            .iter()
-            .filter(|c| c.kind == CandidateKind::PeerReflexive)
-            .count();
-        if learned >= MAX_PEER_REFLEXIVE || !usable(src) {
+        if self.learned >= MAX_PEER_REFLEXIVE || !usable(src) {
             return false;
         }
+        self.learned += 1;
         self.remote.push(Candidate {
             kind: CandidateKind::PeerReflexive,
             addr: src,
@@ -560,7 +638,16 @@ impl<'a> Checks<'a> {
     /// Creator: an `Hs1`.
     fn answer(&mut self, src: SocketAddr, body: &[u8], now: Instant) -> Result<(), ConnectError> {
         if let Some(a) = self.answered.as_ref().filter(|a| a.hs1 == body) {
-            self.outbox.push((src, a.hs2.clone()));
+            // A resend from the peer gets the same Hs2 again. A copy that
+            // someone replays from another address gets nothing.
+            if a.session.peer == src {
+                self.outbox.push((src, a.hs2.clone()));
+            }
+            return Ok(());
+        }
+        // What cannot be an NNpsk0 message 1 is not worth a Noise attempt,
+        // and must not use up the one wrong-password warning.
+        if !HS1_LEN.contains(&body.len()) {
             return Ok(());
         }
         let grace = self.t.wrong_password_after;
@@ -577,11 +664,13 @@ impl<'a> Checks<'a> {
                 self.outbox.push((src, a.hs2.clone()));
                 self.answered = Some(a);
             }
-            None if !self.warned => {
-                self.warned = true;
-                println!("Someone tried to join with the wrong password.");
+            None => {
+                self.heard_peer();
+                if !self.warned {
+                    self.warned = true;
+                    println!("Someone tried to join with the wrong password.");
+                }
             }
-            None => {}
         }
         Ok(())
     }
@@ -653,14 +742,22 @@ fn usable(addr: SocketAddr) -> bool {
 }
 
 /// Adds `c` unless unusable; a known address keeps the higher-priority kind.
-fn add_candidate(list: &mut Vec<Candidate>, c: Candidate) {
+/// Returns whether `c` was added as a new entry.
+fn add_candidate(list: &mut Vec<Candidate>, c: Candidate) -> bool {
     if !usable(c.addr) {
-        return;
+        return false;
     }
     match list.iter_mut().find(|known| known.addr == c.addr) {
-        Some(known) if c.kind.priority() > known.kind.priority() => known.kind = c.kind,
-        Some(_) => {}
-        None => list.push(c),
+        Some(known) => {
+            if c.kind.priority() > known.kind.priority() {
+                known.kind = c.kind;
+            }
+            false
+        }
+        None => {
+            list.push(c);
+            true
+        }
     }
 }
 
@@ -1439,5 +1536,247 @@ mod tests {
             creator.deadline_error(),
             ConnectError::NoPath { remote: Some(_) }
         ));
+    }
+
+    #[tokio::test]
+    async fn creator_with_a_record_outlasts_a_joiner_with_the_wrong_password() {
+        let keys = SessionKeys::derive(&SessionSecret([20; 16]));
+        let (psk_a, psk_b) = (derive_psk(&keys, "a"), derive_psk(&keys, "b"));
+        let (cs, caddr) = loopback_sockets().await;
+        let (js, jaddr) = loopback_sockets().await;
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(info(vec![lan(jaddr)])).await.unwrap();
+        let mut ca = args(Role::Creator, &keys, psk_a, "alice", vec![]);
+        ca.timeouts.joiner_with_remote = ms(800);
+        let started = Instant::now();
+        let creator = connect(cs, ca, rx);
+        let joiner = connect(
+            js,
+            args(Role::Joiner, &keys, psk_b, "bob", vec![lan(caddr)]),
+            closed_rx(),
+        );
+        tokio::pin!(creator);
+        let j = tokio::select! {
+            c = &mut creator => panic!("creator stopped waiting: {:?}", c.err()),
+            j = joiner => j,
+        };
+        assert!(matches!(err(j), ConnectError::WrongPassword));
+        // The path exists, so the 800 ms after the record no longer apply:
+        // the creator waits its full time for a joiner that gets it right.
+        assert!(tokio::time::timeout(ms(500), &mut creator).await.is_err());
+        let e = err(creator.await);
+        let elapsed = started.elapsed();
+        assert!(matches!(e, ConnectError::NoOneJoined), "{e:?}");
+        assert!(elapsed >= ms(2900) && elapsed < ms(4000), "{elapsed:?}");
+        drop(tx);
+    }
+
+    #[test]
+    fn creator_deadline_follows_each_record_until_the_peer_is_heard() {
+        let keys = SessionKeys::derive(&SessionSecret([21; 16]));
+        let (t0, now_ms) = (Instant::now(), 1_000_000_000_000_i64);
+        let a = args(Role::Creator, &keys, [7; 32], "alice", vec![]);
+        let (jwr, wait) = (a.timeouts.joiner_with_remote, a.timeouts.creator_wait);
+        let joiner: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let mut creator = Checks::new(&a, false, t0);
+
+        // Each newer record starts the wait over.
+        creator.add_peer_info(info(vec![lan(joiner)]), t0 + ms(100), now_ms);
+        assert_eq!(creator.deadline, t0 + ms(100) + jwr);
+        creator.add_peer_info(info(vec![lan(joiner)]), t0 + ms(500), now_ms);
+        assert_eq!(creator.deadline, t0 + ms(500) + jwr);
+        // Nothing from the joiner got through: no path.
+        assert!(matches!(
+            creator.deadline_error(),
+            ConnectError::NoPath { remote: Some(_) }
+        ));
+
+        // An authenticated probe proves the path: back to the full wait.
+        let p = probe(&keys.probe_key, [1; 12]).encode();
+        creator.on_datagram(joiner, &p, t0 + ms(600)).unwrap();
+        assert_eq!(creator.deadline, t0 + wait);
+        assert!(matches!(
+            creator.deadline_error(),
+            ConnectError::NoOneJoined
+        ));
+        // A record after that never cuts the wait short, and a late one
+        // still gets its own time.
+        creator.add_peer_info(info(vec![]), t0 + ms(700), now_ms);
+        assert_eq!(creator.deadline, t0 + wait);
+        creator.add_peer_info(info(vec![]), t0 + ms(2900), now_ms);
+        assert_eq!(creator.deadline, t0 + ms(2900) + jwr);
+        assert!(matches!(
+            creator.deadline_error(),
+            ConnectError::NoOneJoined
+        ));
+    }
+
+    #[test]
+    fn a_failed_hs1_also_proves_the_path_but_junk_does_not() {
+        let keys = SessionKeys::derive(&SessionSecret([22; 16]));
+        let t0 = Instant::now();
+        let ca = args(Role::Creator, &keys, [7; 32], "alice", vec![]);
+        let wrong = args(Role::Joiner, &keys, [8; 32], "bob", vec![]);
+        let (caddr, jaddr): (SocketAddr, SocketAddr) = (
+            "127.0.0.1:1000".parse().unwrap(),
+            "127.0.0.1:2000".parse().unwrap(),
+        );
+        let mut creator = Checks::new(&ca, false, t0);
+        creator.add_peer_info(info(vec![]), t0, 0);
+        let record_deadline = creator.deadline;
+
+        creator.on_datagram(jaddr, &[T_HS1; 20], t0).unwrap();
+        assert_eq!(creator.deadline, record_deadline);
+
+        let (_j, hs1) = dialing_joiner(&wrong, caddr, t0);
+        creator.on_datagram(jaddr, &hs1, t0).unwrap();
+        assert_eq!(creator.deadline, t0 + ca.timeouts.creator_wait);
+        assert!(creator.outbox.is_empty());
+    }
+
+    #[test]
+    fn cached_hs2_goes_only_to_the_answered_peer() {
+        let keys = SessionKeys::derive(&SessionSecret([23; 16]));
+        let (psk, now) = ([7; 32], Instant::now());
+        let ca = args(Role::Creator, &keys, psk, "alice", vec![]);
+        let ja = args(Role::Joiner, &keys, psk, "bob", vec![]);
+        let caddr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let jaddr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let elsewhere: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let mut creator = Checks::new(&ca, false, now);
+        let (_j, hs1) = dialing_joiner(&ja, caddr, now);
+
+        creator.on_datagram(jaddr, &hs1, now).unwrap();
+        assert_eq!(std::mem::take(&mut creator.outbox).len(), 1);
+        // The same Hs1 replayed from another address is not answered...
+        creator.on_datagram(elsewhere, &hs1, now).unwrap();
+        assert!(creator.outbox.is_empty());
+        // ...but a resend from the peer still is.
+        creator.on_datagram(jaddr, &hs1, now).unwrap();
+        let resent = std::mem::take(&mut creator.outbox);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].0, jaddr);
+    }
+
+    #[test]
+    fn signaled_candidates_are_capped_without_eviction() {
+        let keys = SessionKeys::derive(&SessionSecret([24; 16]));
+        let now = Instant::now();
+        let at = |i: u16| SocketAddr::from(([10, 0, 0, 1], 1000 + i));
+        let initial: Vec<Candidate> = (0..10).map(|i| lan(at(i))).collect();
+        let a = args(Role::Joiner, &keys, [7; 32], "bob", initial);
+        let mut checks = Checks::new(&a, false, now);
+        let more: Vec<Candidate> = (10..30).map(|i| lan(at(i))).collect();
+        checks.add_peer_info(info(more), now, unix_ms());
+        assert_eq!(checks.remote.len(), MAX_SIGNALED);
+        // The first ones stay; the extras were ignored.
+        assert!(checks.remote.iter().map(|c| c.addr).eq((0..16).map(at)));
+
+        // A known address can still be upgraded once the cap is reached...
+        let upgraded = Candidate {
+            kind: CandidateKind::Lan,
+            addr: at(0),
+        };
+        checks.add_peer_info(info(vec![upgraded]), now, unix_ms());
+        assert_eq!(checks.remote.len(), MAX_SIGNALED);
+
+        // ...and peer-reflexive candidates have their own budget.
+        for i in 0..6u8 {
+            let src = SocketAddr::from(([127, 0, 0, 1], 3000 + u16::from(i)));
+            let p = probe(&keys.probe_key, [i; 12]).encode();
+            checks.on_datagram(src, &p, now).unwrap();
+        }
+        assert_eq!(checks.remote.len(), MAX_SIGNALED + MAX_PEER_REFLEXIVE);
+    }
+
+    #[test]
+    fn only_a_plausible_hs1_triggers_the_wrong_password_warning() {
+        let keys = SessionKeys::derive(&SessionSecret([25; 16]));
+        let now = Instant::now();
+        let ca = args(Role::Creator, &keys, [7; 32], "alice", vec![]);
+        let wrong = args(Role::Joiner, &keys, [8; 32], "bob", vec![]);
+        let caddr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let jaddr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let mut creator = Checks::new(&ca, false, now);
+
+        // Too short or too long to be NNpsk0 message 1: not even a try.
+        for len in [0, 1, 47, 81, 200] {
+            let mut junk = vec![0x5Au8; 1 + len];
+            junk[0] = T_HS1;
+            creator.on_datagram(jaddr, &junk, now).unwrap();
+            assert!(!creator.warned, "{len} bytes");
+        }
+        // A real Hs1 under another password is what the warning is for.
+        let (_j, hs1) = dialing_joiner(&wrong, caddr, now);
+        creator.on_datagram(jaddr, &hs1, now).unwrap();
+        assert!(creator.warned);
+    }
+
+    #[test]
+    fn a_replayed_probe_teaches_nothing_even_after_the_ttl() {
+        let keys = SessionKeys::derive(&SessionSecret([26; 16]));
+        let t0 = Instant::now();
+        let a = args(Role::Joiner, &keys, [7; 32], "bob", vec![]);
+        let mut checks = Checks::new(&a, false, t0);
+        let first: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let later: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let p = probe(&keys.probe_key, [9; 12]).encode();
+
+        checks.on_datagram(first, &p, t0).unwrap();
+        assert_eq!(checks.remote.len(), 1);
+        // Long after any per-probe timer, the same probe from elsewhere is
+        // still answered once, and still teaches no address.
+        let late = t0 + Duration::from_secs(60);
+        checks.send_probes(late);
+        checks.outbox.clear();
+        checks.on_datagram(later, &p, late).unwrap();
+        assert_eq!(checks.outbox.len(), 1);
+        assert_eq!(checks.outbox[0].0, later);
+        assert_eq!(checks.remote.len(), 1);
+    }
+
+    #[test]
+    fn seen_probes_remember_the_most_recent_ones() {
+        let mut seen = SeenTxids::default();
+        let txid = |i: u32| {
+            let mut t = [0u8; 12];
+            t[..4].copy_from_slice(&i.to_be_bytes());
+            t
+        };
+        assert!(seen.insert(txid(0)));
+        assert!(!seen.insert(txid(0)));
+        for i in 1..SEEN_PROBES as u32 {
+            assert!(seen.insert(txid(i)));
+        }
+        // Full: the oldest is still there until one more comes in.
+        assert!(!seen.insert(txid(0)));
+        assert!(seen.insert(txid(SEEN_PROBES as u32)));
+        assert!(seen.insert(txid(0)));
+        assert!(!seen.insert(txid(SEEN_PROBES as u32)));
+    }
+
+    #[test]
+    fn probes_from_unusable_sources_are_not_answered() {
+        let keys = SessionKeys::derive(&SessionSecret([27; 16]));
+        let now = Instant::now();
+        let a = args(Role::Creator, &keys, [7; 32], "alice", vec![]);
+        let mut checks = Checks::new(&a, false, now);
+        let p = probe(&keys.probe_key, [3; 12]).encode();
+        for src in [
+            "0.0.0.0:5",
+            "10.0.0.1:0",
+            "224.0.0.1:5",
+            "255.255.255.255:5",
+            "[ff02::1]:5",
+        ] {
+            checks.on_datagram(src.parse().unwrap(), &p, now).unwrap();
+            assert!(checks.outbox.is_empty(), "{src}");
+        }
+        assert!(checks.remote.is_empty());
+        // The same probe from a real address is answered.
+        checks
+            .on_datagram("127.0.0.1:4000".parse().unwrap(), &p, now)
+            .unwrap();
+        assert_eq!(checks.outbox.len(), 1);
     }
 }
