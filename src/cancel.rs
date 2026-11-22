@@ -14,7 +14,8 @@ use std::task::Poll;
 use tokio::sync::{oneshot, watch};
 
 /// The user pressed Ctrl-C. Travels as an `anyhow` error to `main`, which
-/// prints `Cancelled.` and exits with 130 once everything is released.
+/// prints `Cancelled.` and exits with 130 once everything is released. A
+/// second press while that happens exits with 130 at once.
 #[derive(Debug)]
 pub struct Cancelled;
 
@@ -54,7 +55,7 @@ impl Cancel {
                 Poll::Pending => ctrl_c.await,
             };
             if pressed.is_ok() {
-                let _ = tx.send(true);
+                after_first_press(tx, tokio::signal::ctrl_c(), || force_exit()).await;
             }
         });
         let _ = installed_rx.await;
@@ -86,9 +87,35 @@ impl Cancel {
     }
 }
 
+/// Printed when a second Ctrl-C cuts the cleanup short.
+const FORCED: &str =
+    "\nCancelled without cleaning up. A router port, if one was opened, expires on its own.";
+
+/// After the first press: everyone waiting is told, and the cleanup runs.
+/// A `second` press means the user wants out now: `force` is called instead
+/// of waiting for the cleanup to end.
+async fn after_first_press(
+    tx: watch::Sender<bool>,
+    second: impl Future<Output = std::io::Result<()>>,
+    force: impl FnOnce(),
+) {
+    let _ = tx.send(true);
+    if second.await.is_ok() {
+        force();
+    }
+}
+
+/// Leaves at once, mapping or not: the user asked twice.
+fn force_exit() -> ! {
+    println!("{FORCED}");
+    std::process::exit(130);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
@@ -116,6 +143,49 @@ mod tests {
 
         // Already pressed: the work does not even get to finish.
         assert!(cancel.run(async { 7 }).await.is_err());
+    }
+
+    /// A second press that comes when `release` is sent, and a flag that
+    /// tells whether the way out was forced.
+    fn second_press() -> (
+        oneshot::Sender<()>,
+        impl Future<Output = std::io::Result<()>>,
+        Arc<AtomicBool>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let second = async { rx.await.map_err(std::io::Error::other) };
+        (tx, second, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[tokio::test]
+    async fn a_second_press_forces_the_way_out() {
+        let (tx, cancel) = Cancel::channel();
+        let (release, second, forced) = second_press();
+        let flag = Arc::clone(&forced);
+        let presses = tokio::spawn(after_first_press(tx, second, move || {
+            flag.store(true, Ordering::SeqCst)
+        }));
+
+        // The first press reaches everyone, and the cleanup runs...
+        cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!forced.load(Ordering::SeqCst));
+        // ...until a second one cuts it short.
+        release.send(()).unwrap();
+        presses.await.unwrap();
+        assert!(forced.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn no_second_press_means_no_forced_exit() {
+        let (tx, cancel) = Cancel::channel();
+        let (release, second, forced) = second_press();
+        let flag = Arc::clone(&forced);
+        // The signal stream ends (no handler) instead of a second press.
+        drop(release);
+        after_first_press(tx, second, move || flag.store(true, Ordering::SeqCst)).await;
+        assert!(cancel.is_cancelled());
+        assert!(!forced.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

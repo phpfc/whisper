@@ -1,3 +1,4 @@
+use crate::candidates::CandidateKind;
 use crate::connect::Connection;
 use crate::crypto::Transport;
 use crate::session::MAX_MESSAGE_LEN;
@@ -116,6 +117,21 @@ fn send_payload(
     }
 }
 
+/// The first lines of the chat. The screen is cleared when it opens, so what
+/// was printed just before (the path, the fingerprint) is repeated here.
+fn opening_lines(peer: &str, path: CandidateKind, fingerprint: &str) -> Vec<String> {
+    vec![
+        format!("Connected to {peer} via {path}"),
+        "Your messages are end-to-end encrypted.".to_string(),
+        format!("Session fingerprint: {fingerprint} (should match your peer's)"),
+        String::new(),
+    ]
+}
+
+fn title(peer: &str, you: &str) -> String {
+    format!("Chat with {peer} | You: {you} | Press Esc or Ctrl-C to exit")
+}
+
 /// Raw mode for as long as the guard lives, so every way out of the chat
 /// (including an error or a panic) gives the terminal back.
 struct RawModeGuard;
@@ -142,6 +158,8 @@ pub struct P2PChat {
     peer_addr: SocketAddr,
     transport: Arc<Transport>,
     fingerprint: String,
+    /// The kind of path the connection took.
+    path: CandidateKind,
     /// When something authentic last arrived from the peer.
     last_heard: Instant,
     /// The "connection lost" notice is on screen.
@@ -155,10 +173,10 @@ impl P2PChat {
         let Connection {
             socket,
             peer,
+            path,
             transport,
             peer_username,
             fingerprint,
-            ..
         } = conn;
         Self {
             username,
@@ -169,6 +187,7 @@ impl P2PChat {
             peer_addr: peer,
             transport,
             fingerprint,
+            path,
             last_heard: Instant::now(),
             lost_shown: false,
             peer_left: false,
@@ -242,14 +261,9 @@ impl P2PChat {
             );
         });
 
-        self.add_message(format!("Connected to {}", self.peer_username));
-        self.add_message("Your messages are end-to-end encrypted.".to_string());
-        // The chat clears the screen, so the line printed before it is gone.
-        self.add_message(format!(
-            "Session fingerprint: {} (should match your peer's)",
-            self.fingerprint
-        ));
-        self.add_message(String::new());
+        for line in opening_lines(&self.peer_username, self.path, &self.fingerprint) {
+            self.add_message(line);
+        }
 
         self.last_heard = Instant::now();
         let result = self.run_ui(msg_rx);
@@ -298,10 +312,7 @@ impl P2PChat {
                     })
                     .collect();
 
-                let title = format!(
-                    "Chat with {} | You: {} | Press ESC to exit",
-                    self.peer_username, self.username
-                );
+                let title = title(&self.peer_username, &self.username);
                 let messages_list =
                     List::new(messages).block(Block::default().borders(Borders::ALL).title(title));
 
@@ -493,6 +504,27 @@ mod tests {
                 KeyEventKind::Repeat
             )),
             KeyAction::Char('x')
+        );
+    }
+
+    #[test]
+    fn the_chat_opens_with_the_path_and_the_fingerprint() {
+        assert_eq!(
+            opening_lines("alice", CandidateKind::Mapped, "3F9A0C11 52B7E4D8"),
+            [
+                "Connected to alice via mapped",
+                "Your messages are end-to-end encrypted.",
+                "Session fingerprint: 3F9A0C11 52B7E4D8 (should match your peer's)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_title_names_both_ways_out() {
+        assert_eq!(
+            title("alice", "bob"),
+            "Chat with alice | You: bob | Press Esc or Ctrl-C to exit"
         );
     }
 
