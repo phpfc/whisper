@@ -72,10 +72,20 @@ pub enum V4Class {
     Loopback,
     LinkLocal,
     Unspecified,
+    /// Not reachable on the internet: "this network" (0/8), IETF protocol
+    /// assignments (192.0.0.0/24, DS-Lite's 192.0.0.0/29 among them),
+    /// benchmarking (198.18.0.0/15), multicast (224/4), the future-use block
+    /// (240/4, broadcast included) and the documentation ranges.
+    Reserved,
 }
 
 pub fn classify_v4(ip: Ipv4Addr) -> V4Class {
-    let [a, b, _, _] = ip.octets();
+    let [a, b, c, _] = ip.octets();
+    let reserved = a == 0
+        || (a, b, c) == (192, 0, 0)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 224
+        || [(192, 0, 2), (198, 51, 100), (203, 0, 113)].contains(&(a, b, c));
     if ip.is_unspecified() {
         V4Class::Unspecified
     } else if ip.is_loopback() {
@@ -86,6 +96,8 @@ pub fn classify_v4(ip: Ipv4Addr) -> V4Class {
         V4Class::Private
     } else if a == 100 && (64..=127).contains(&b) {
         V4Class::Cgnat
+    } else if reserved {
+        V4Class::Reserved
     } else {
         V4Class::Public
     }
@@ -197,8 +209,12 @@ pub fn detect_cgnat(
         return Some(true);
     }
     if let Some(ext) = router_ext {
-        let behind = matches!(classify_v4(ext), V4Class::Cgnat | V4Class::Private)
-            || stun_ip.is_some_and(|s| s != ext);
+        // A shared, private or reserved address on the router's WAN side
+        // means another NAT further up (DS-Lite's 192.0.0.0/29 is the ISP's).
+        let behind = matches!(
+            classify_v4(ext),
+            V4Class::Cgnat | V4Class::Private | V4Class::Reserved
+        ) || stun_ip.is_some_and(|s| s != ext);
         return Some(behind);
     }
     match (primary, stun_ip) {
@@ -242,6 +258,37 @@ mod tests {
         assert_eq!(classify_v4(ip4("100.128.0.1")), V4Class::Public);
         assert_eq!(classify_v4(ip4("127.0.0.1")), V4Class::Loopback);
         assert_eq!(classify_v4(ip4("169.254.1.1")), V4Class::LinkLocal);
+    }
+
+    #[test]
+    fn reserved_ranges_are_not_public() {
+        let reserved = [
+            "0.1.2.3", "192.0.0.2", "192.0.0.170", "198.18.0.1", "198.19.255.255", "224.0.0.1",
+            "239.255.255.250", "240.0.0.1", "255.255.255.254", "255.255.255.255", "192.0.2.1",
+            "198.51.100.7", "203.0.113.5",
+        ];
+        for ip in reserved {
+            assert_eq!(classify_v4(ip4(ip)), V4Class::Reserved, "{ip}");
+        }
+        // Right next to them.
+        let public = [
+            "1.0.0.1", "192.0.1.1", "192.0.3.1", "198.17.255.255", "198.20.0.1",
+            "198.51.101.1", "203.0.112.255", "203.0.114.1", "223.255.255.255",
+        ];
+        for ip in public {
+            assert_eq!(classify_v4(ip4(ip)), V4Class::Public, "{ip}");
+        }
+        assert_eq!(classify_v4(ip4("0.0.0.0")), V4Class::Unspecified);
+    }
+
+    #[test]
+    fn reserved_addresses_are_neither_mapped_nor_proof_of_a_public_ip() {
+        // DS-Lite: the router's WAN side is 192.0.0.0/29 and the ISP does the NAT.
+        assert_eq!(mapped_candidate(Some("192.0.0.2:4000".parse().unwrap())), None);
+        assert_eq!(mapped_candidate(Some("203.0.113.5:4000".parse().unwrap())), None);
+        assert_eq!(detect_cgnat(Some(ip4("192.168.0.10")), Some(ip4("192.0.0.2")), None), Some(true));
+        // A reserved primary address that STUN echoes proves nothing.
+        assert_eq!(detect_cgnat(Some(ip4("198.18.0.5")), None, Some(ip4("198.18.0.5"))), None);
     }
 
     #[test]

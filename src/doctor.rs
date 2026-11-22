@@ -1,14 +1,15 @@
 //! `whisper doctor`: reports whether this network can host or join sessions.
 
 use anyhow::Result;
+use mainline::async_dht::AsyncDht;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cancel::Cancel;
 use crate::connect::ConnectError;
 use crate::gather::{gather, NetSummary};
 use crate::portmap::ProbeFlags;
-use crate::signal::public_dht;
+use crate::signal::{bootstrap_time, public_dht};
 use crate::stun::NatMapping;
 
 /// How long the DHT gets to bootstrap before it counts as unreachable.
@@ -19,7 +20,8 @@ pub struct DoctorReport {
     pub ipv6: Option<Ipv6Addr>,
     pub probe: Option<ProbeFlags>,
     pub router_ext: Option<Ipv4Addr>,
-    pub stun_ip: Option<Ipv4Addr>,
+    /// Some STUN server told us our address.
+    pub stun_answered: bool,
     pub summary: NetSummary,
     /// Time the DHT took to bootstrap; `None` if it did not.
     pub dht: Option<Duration>,
@@ -173,6 +175,7 @@ pub fn render(r: &DoctorReport) -> String {
     let nat = match r.summary.nat {
         NatMapping::EndpointIndependent => "endpoint-independent (good for hole punching)",
         NatMapping::EndpointDependent => "symmetric (hole punching unlikely)",
+        NatMapping::Unknown if r.stun_answered => "unknown (only one STUN server answered)",
         NatMapping::Unknown => "unknown (STUN unreachable)",
     };
 
@@ -194,19 +197,29 @@ Verdict:       {}
     )
 }
 
+/// Printed before gathering: the check maps a router port, and the user is
+/// told before anything is done to the router.
+const ROUTER_NOTICE: &str = "Checking your router (a test port is opened and closed again)...";
+
 /// Time the public DHT takes to bootstrap, if it does within `DHT_TIMEOUT`.
 async fn check_dht() -> Option<Duration> {
-    let dht = public_dht().ok()?;
-    let start = Instant::now();
-    let bootstrapped = tokio::time::timeout(DHT_TIMEOUT, dht.bootstrapped())
-        .await
-        .ok()?;
-    bootstrapped.then(|| start.elapsed())
+    check_dht_with(public_dht).await
+}
+
+/// [`check_dht`] with the node started by `start`. That runs off the async
+/// workers (it resolves the bootstrap hostnames with blocking lookups), so
+/// Ctrl-C still gets through while it does.
+async fn check_dht_with(
+    start: impl FnOnce() -> std::io::Result<AsyncDht> + Send + 'static,
+) -> Option<Duration> {
+    let dht = tokio::task::spawn_blocking(start).await.ok()?.ok()?;
+    bootstrap_time(&dht, DHT_TIMEOUT).await
 }
 
 /// Gathers network info, checks the DHT and prints the report. Ctrl-C ends it
 /// with a `Cancelled` error, after releasing any router mapping.
 pub async fn run(cancel: &Cancel) -> Result<()> {
+    println!("{ROUTER_NOTICE}");
     let mut g = gather(cancel).await?;
 
     // The mapping is only needed to learn whether the router grants one, so
@@ -219,7 +232,7 @@ pub async fn run(cancel: &Cancel) -> Result<()> {
         ipv6: g.ipv6_addr,
         probe: g.probe,
         router_ext: g.router_ext.map(|a| *a.ip()),
-        stun_ip: g.stun_ip(),
+        stun_answered: g.stun_addr.is_some(),
         summary: g.summary,
         dht: cancel.run(check_dht()).await?,
     };
@@ -230,6 +243,7 @@ pub async fn run(cancel: &Cancel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn masks_addresses() {
@@ -271,7 +285,7 @@ mod tests {
                 pcp: false,
             }),
             router_ext: Some("189.40.12.34".parse().unwrap()),
-            stun_ip: Some("189.40.12.34".parse().unwrap()),
+            stun_answered: true,
             summary: NetSummary {
                 ipv6: true,
                 mapped: true,
@@ -303,7 +317,7 @@ Verdict:       can host sessions
                 pcp: false,
             }),
             router_ext: None,
-            stun_ip: None,
+            stun_answered: false,
             summary: NetSummary {
                 ipv6: false,
                 mapped: false,
@@ -336,6 +350,71 @@ Verdict:       direct connections unlikely from this network
         let out = render(&r);
         assert!(out.contains("\nCGNAT:         unknown\n"));
         assert!(out.contains("\nNAT mapping:   unknown (STUN unreachable)\n"));
+
+        // One server answered: we have an address, just not the NAT type.
+        // Nothing else changes.
+        let one = render(&DoctorReport {
+            stun_answered: true,
+            ..r
+        });
+        assert_eq!(
+            one,
+            out.replace(
+                "unknown (STUN unreachable)",
+                "unknown (only one STUN server answered)"
+            )
+        );
+    }
+
+    #[test]
+    fn says_that_it_tests_the_router() {
+        assert_eq!(
+            ROUTER_NOTICE,
+            "Checking your router (a test port is opened and closed again)..."
+        );
+    }
+
+    /// A DHT node start that blocks for `for_ms` and then fails.
+    fn slow_start(for_ms: u64) -> impl FnOnce() -> std::io::Result<AsyncDht> + Send + 'static {
+        move || {
+            std::thread::sleep(Duration::from_millis(for_ms));
+            Err(std::io::Error::other("no DHT here"))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_dht_node_starts_off_the_async_workers() {
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let ticker = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        // One worker thread only: if the start blocked it, nothing would tick.
+        tokio::select! {
+            r = check_dht_with(slow_start(300)) => assert_eq!(r, None),
+            () = ticker => unreachable!(),
+        }
+        let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ticks >= 10, "{ticks} ticks");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctrl_c_ends_the_dht_check_while_the_node_starts() {
+        let (tx, cancel) = Cancel::channel();
+        let press = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(true).unwrap();
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(cancel.run(check_dht_with(slow_start(1000))), press);
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     fn s(ipv6: bool, mapped: bool, cgnat: Option<bool>, nat: NatMapping) -> NetSummary {

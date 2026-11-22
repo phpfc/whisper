@@ -59,9 +59,12 @@ pub async fn bootstrap_time(dht: &AsyncDht, limit: Duration) -> Option<Duration>
 }
 
 /// The settings of a DHT client node: it bootstraps from `bootstrap`, or from
-/// the default public nodes when that is `None`.
+/// the default public nodes when that is `None`. A client needs no fixed
+/// port, so the system picks one: the default 6881 may belong to a torrent
+/// client, and on Windows both sockets would bind it.
 fn dht_builder(bootstrap: Option<&[String]>) -> mainline::DhtBuilder {
     let mut builder = mainline::Dht::builder();
+    builder.port(0);
     if let Some(nodes) = bootstrap {
         builder.bootstrap(nodes);
     }
@@ -409,6 +412,18 @@ mod tests {
             known.iter().all(|n| n.address().ip().is_loopback()),
             "{known:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_client_node_lets_the_system_pick_its_port() {
+        // A fixed port (6881 by default) would be shared with a torrent
+        // client, and on Windows two sockets can bind it at once.
+        let node = dht_builder(Some(&[]))
+            .bind_address(std::net::Ipv4Addr::LOCALHOST)
+            .build()
+            .unwrap()
+            .as_async();
+        assert_ne!(node.info().await.local_addr().port(), 6881);
     }
 
     #[tokio::test]

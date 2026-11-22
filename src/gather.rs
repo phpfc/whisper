@@ -105,11 +105,6 @@ impl Gathered {
             .find(|c| c.kind == CandidateKind::Mapped)
             .map(|c| c.addr.port())
     }
-
-    /// The IPv4 address STUN servers see us at.
-    pub fn stun_ip(&self) -> Option<Ipv4Addr> {
-        v4_ip(self.stun_addr)
-    }
 }
 
 fn v4_ip(addr: Option<SocketAddr>) -> Option<Ipv4Addr> {

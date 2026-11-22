@@ -115,7 +115,11 @@ impl Drop for PortMap {
 mod tests {
     use super::*;
 
+    // Both tests ask the router of the machine running them for a real
+    // mapping, which `cargo test` must not do behind the developer's back.
+    // Run them with `cargo test -- --ignored portmap`.
     #[tokio::test]
+    #[ignore = "talks to the router of the machine running the tests"]
     async fn close_completes_within_three_seconds() {
         let pm = PortMap::start(40_123);
         let _ = pm.wait_external(Duration::from_millis(500)).await;
@@ -125,6 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "talks to the router of the machine running the tests"]
     async fn release_barrier_is_answered_before_the_deadline() {
         let pm = PortMap::start(40_124);
         pm.client.deactivate();
