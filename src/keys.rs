@@ -111,6 +111,39 @@ mod tests {
         );
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Wire contract: both peers must derive the same keys, whichever
+    /// version each runs. The HKDF values were checked against an
+    /// independent HKDF-SHA256 (Python `hmac`/`hashlib`).
+    #[test]
+    fn derivation_matches_known_answers() {
+        let k = SessionKeys::derive(&SessionSecret(std::array::from_fn(|i| i as u8)));
+        assert_eq!(
+            hex(&k.dht_seed),
+            "57e1bc905300704262d4abcc55f7f4b75120b7c1c33996fd21e657c09c1fcc02"
+        );
+        assert_eq!(
+            hex(&k.record_key),
+            "914bc4664c5ca0e04fd2c883169cfb69eb8a827509cb8453dc467e6ec40f72de"
+        );
+        assert_eq!(
+            hex(&k.probe_key),
+            "92997aa334044a0822875e0059fb8a7fbb39e6847f0f8429e9bd592ad83666e3"
+        );
+        assert_eq!(hex(&k.argon_salt), "b0e2941636916a6c10e0674ccd2d9a91");
+        assert_eq!(
+            hex(&k.psk_base),
+            "1827ddc0051dedd5efd4bc1b4d0691361338d8e83f42bff29e8907f57d1348fa"
+        );
+        assert_eq!(
+            hex(&derive_psk(&k, "pw")),
+            "fd33f8f749031487819f09032d3504c00d2aa51f6964a3cb80b7f043b03809cb"
+        );
+    }
+
     #[test]
     fn psk_depends_on_password_and_allows_empty() {
         let k = SessionKeys::derive(&SessionSecret([9; 16]));

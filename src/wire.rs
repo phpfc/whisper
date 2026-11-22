@@ -246,6 +246,35 @@ mod tests {
         assert!(!verify(&K, &Packet::ProbeAck { txid, tag }));
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Wire contract: the exact bytes both versions must agree on. The tags
+    /// were checked against an independent HMAC-SHA256 (Python `hmac`).
+    #[test]
+    fn probes_match_known_answers() {
+        let key: [u8; 32] = std::array::from_fn(|i| 0x20 + i as u8);
+        let txid: [u8; 12] = std::array::from_fn(|i| 0xA0 + i as u8);
+        assert_eq!(
+            hex(&probe(&key, txid).encode()),
+            "a1a0a1a2a3a4a5a6a7a8a9aaabaa816a8be55c738a66d2e52d56e8ba90"
+        );
+        assert_eq!(
+            hex(&probe_ack(&key, txid).encode()),
+            "a2a0a1a2a3a4a5a6a7a8a9aaab13a60f5bfaa7de710d9e2442a74051c0"
+        );
+    }
+
+    #[test]
+    fn data_nonce_is_big_endian() {
+        let data = Packet::Data {
+            nonce: 0x0102_0304_0506_0708,
+            ciphertext: b"xy",
+        };
+        assert_eq!(data.encode(), [T_DATA, 1, 2, 3, 4, 5, 6, 7, 8, b'x', b'y']);
+    }
+
     #[test]
     fn chat_payload_roundtrip_and_invalid_utf8() {
         for p in [
