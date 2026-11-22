@@ -42,8 +42,8 @@ The full design and its rationale are in
 1. **Use STUN and the DHT** - STUN to learn the public address and the type of NAT, the DHT
    to exchange encrypted candidates
 2. **Open a router port by itself** - Through UPnP, NAT-PMP or PCP, with a notice
-3. **Fail when both peers are behind symmetric NAT** - That case needs a relay, which is
-   out of bounds
+3. **Fail when both peers are behind symmetric NAT** (and neither has IPv6 or a router
+   port) - That case needs a relay, which is out of bounds
 
 ---
 
@@ -52,7 +52,8 @@ The full design and its rationale are in
 Each peer gathers **candidates**: addresses where it might be reached. The creator puts a
 few in the session code and publishes all of them, encrypted, on the DHT. The joiner
 publishes its own on the DHT. Both then probe every candidate of the other at the same time.
-The first path that completes the Noise handshake carries the chat.
+Among the paths that answer, the joiner takes the one with the highest priority and runs the
+Noise handshake on it; that path carries the chat.
 
 "Host" is not a negotiated role. It is whichever side has an address the other can reach.
 The roles that exist are only *creator* (the one who made the code, the Noise responder)
@@ -65,10 +66,13 @@ and *joiner* (the one who used it, the Noise initiator).
  publish "c" ───────┤                           ├── publish "j"
  read "j" ──────────┘      BitTorrent DHT        └── read "c"
         └─── both probe every candidate every 200 ms (hole punching) ───┘
-                  first path with a valid handshake = chat
+            best path that answers + valid handshake = chat
 ```
 
 ### Connection ladder
+
+These are not tried one after the other: every candidate is probed at once, and the order
+below is only the priority among the paths that answer.
 
 1. **LAN / IPv6**: private IPv4 or global IPv6 addresses on the machine's interfaces
 2. **Router port**: opened through UPnP, NAT-PMP or PCP, advertised as `mapped`
@@ -100,38 +104,50 @@ and *joiner* (the one who used it, the Noise initiator).
 ## Session Code (v3)
 
 ```
-base58( 3 || secret[16] || n || n * address )     n <= 3
+base58( 3 || secret[16] || n || n * address || check[2] )     n <= 3
 address = 4 || ipv4[4] || port[2]  |  6 || ipv6[16] || port[2]
+check   = first 2 bytes of SHA-256 over everything before it
 ```
 
 - `secret`: 128 random bits. Everything else is derived from it (see Cryptography)
 - `address`: the direct candidates, those that work without signaling: the router-mapped
   address and, if present, one IPv6 and one LAN address, in that order. They let the joiner
   connect at once, before the DHT answers
-- Length: 24 characters with no addresses, about 69 with all three
+- `check`: catches a mistyped or cut-off code at once, with `Invalid session code...`
+  (a typo slips through about once in 65,536)
+- Length: 27 characters with no addresses, 72 with all three
 - The leading `3` is the format version. Codes from 0.2 (`ip:port#id#salt`) are rejected
   with a message saying so
+- Decoding ignores whitespace and zero-width characters anywhere, and straight or
+  typographic quotes around the code
 
-Example: `BGUUsqBDHSSwBjzHNZzr6i2xDb9yxSvxnjDGK4BdxHpCWQQx3ne73PfHUZd121wEAcxyW`
+Example (yours will differ; this one does not decode):
+`4kE7Ytq0OIlXw9RbMz3NfVcH8pJs2LgAeQd5Ku6nTW1yBo0OIlCrmZxS7vGh4iDaFj9P`
 
 ## Candidates
 
 Two UDP sockets are bound: IPv4 on `0.0.0.0:0` and, if the machine has a global IPv6
-address, IPv6 on `[::]:0`. The same socket is used for STUN, for the port mapping and for
-the chat, so the NAT mappings learned along the way are the ones the chat uses.
+address, IPv6 on the address the OS would send from (found by connecting a UDP socket to a
+public address, which sends nothing). Bound like that, everything leaves from the address we
+advertise, so the peer's stateful firewall lets the replies in. If that bind fails, the IPv6
+socket goes on `[::]:0`. The same socket is used for STUN, for the port mapping and for the
+chat, so the NAT mappings learned along the way are the ones the chat uses.
 
 | Kind | Source | Priority |
 |------|--------|----------|
 | `lan` | Private IPv4 on an interface (never CGNAT space, so VPN addresses stay out) | 5 |
-| `ipv6` | Global IPv6 (2000::/3) on an interface | 4 |
+| `ipv6` | The global IPv6 (2000::/3) the socket is bound to; with `[::]`, up to 3 from the interfaces | 4 |
 | `mapped` | Router-mapped external address, only if it is public | 3 |
 | `reflexive` | Address STUN saw | 2 |
 | `peer-reflexive` | Source of a valid probe from an address we did not know | 1 |
 
-A `mapped` address that is private or in 100.64.0.0/10 means double NAT. It is dropped, and
-the mapping is closed again right away instead of being left on the router.
-When a valid probe arrives from an unknown address (the other NAT picked a new port), we
-answer it and it becomes a candidate, up to 4 of them.
+A `mapped` address that is private, in 100.64.0.0/10 or in a reserved range (DS-Lite's
+192.0.0.0/29, documentation and benchmark ranges, multicast, 240/4) means another NAT
+upstream. It is dropped, and the mapping is closed again right away instead of being left on
+the router.
+At most 16 candidates are taken from the code and the peer's records. When a valid probe
+arrives from an unknown address (the other NAT picked a new port), we answer it and it
+becomes a candidate, up to 4 of them.
 
 ## Router Port Mapping
 
@@ -162,6 +178,12 @@ answer it and it becomes a candidate, up to 4 of them.
   code
 - If the DHT cannot be started, a joiner whose code has direct addresses carries on with
   those, and says so. Without any it stops at once
+- Once the node runs, a background check (10 s at most) tells whether it bootstraps; nothing
+  waits for it. A joiner whose code has no direct address stops as soon as that check fails
+  and no STUN server answered either: UDP is blocked and nobody can be found. Otherwise a
+  connection that fails says, at the end, that the DHT is unreachable or that UDP seems
+  blocked
+- The DHT client binds a port the system picks, not the usual 6881
 
 ## Connectivity Checks
 
@@ -175,13 +197,15 @@ on the shared socket (STUN starts with `0x00`..`0x3F`).
 | `Data` | `[type][nonce u64][ChaCha20-Poly1305 ciphertext]` |
 
 - Every 200 ms each side sends a `Probe` to every remote candidate. A valid `Probe` is
-  answered with a `ProbeAck` to the packet's source address
+  answered with one `ProbeAck` to the packet's source address (never to port 0, broadcast or
+  multicast). A replayed probe is still answered once but teaches no address
 - Anything that does not parse, fails the tag check or fails Noise is dropped without a
-  reply, so the open port cannot be used as a reflector or to scan for whisper
+  reply: no amplification, and no reply to unauthenticated packets, so the open port does
+  not answer scans for whisper
 - The joiner waits 300 ms after the first confirmed address, takes the confirmed one with
   the highest priority and sends `Hs1` there (resent every 500 ms). The creator answers with
-  `Hs2`. The joiner then sends `Ping`s, and the first one the creator can open completes the
-  session
+  `Hs2`, and resends that same `Hs2` only to the address the `Hs1` came from. The joiner then
+  sends `Ping`s, and the first one the creator can open completes the session
 
 ## Cryptography
 
@@ -194,9 +218,10 @@ on the shared socket (STUN starts with `0x00`..`0x3F`).
 | Replay | 64-packet sliding window, as in WireGuard |
 | Fingerprint | First 16 bytes of the handshake hash, shown on both sides |
 
-A wrong password fails the handshake and shows `wrong password or invalid code`. A wrong
-secret in the code never gets that far: its probes carry a tag that does not verify, so
-nobody answers and no handshake starts. Messages are at most 1000 bytes, so a datagram stays
+A wrong password fails the handshake and shows `wrong password or invalid code`. A
+mistyped code never gets that far: its checksum fails. A well-formed code with another
+secret (from another session, say) does not either: its probes carry a tag that does not
+verify, so nobody answers and no handshake starts. Messages are at most 1000 bytes, so a datagram stays
 under 1200 bytes and is never fragmented.
 
 ## Timeouts
@@ -205,8 +230,11 @@ under 1200 bytes and is never fragmented.
 |------|-------|
 | Probe interval | 200 ms |
 | Creator waits for a peer | 10 min |
-| Either side gives up after the other's candidates arrive | 45 s |
+| Joiner gives up after the creator's candidates arrive | 45 s |
+| Creator gives up after the joiner's candidates arrive, if nothing from the joiner got through | 45 s after the latest record |
 | Joiner gives up if the creator's candidates never arrive | 60 s |
+| STUN step, all servers together | 6 s at most |
+| DHT bootstrap check | 10 s at most, in the background |
 | Wrong password reported | 5 s after the first handshake message |
 | Keepalive | 15 s |
 | "Connection lost" shown | 45 s without a valid packet |
@@ -219,14 +247,15 @@ under 1200 bytes and is never fragmented.
 
 | Scenario | Behavior |
 |----------|----------|
-| No one joins | After 10 min: `No one joined within 10 minutes. Create a new session to try again.` |
+| No one joins | After 10 min: `No one joined within 10 minutes. Create a new session to try again.` If the DHT never bootstrapped, the message says the DHT is unreachable or that UDP seems blocked instead |
+| Joiner gets through but cannot finish (wrong password) | The creator keeps waiting its 10 min for a joiner with the right password, and warns once |
 | Wrong password | `wrong password or invalid code`, 5 s after the first handshake message |
 | Code from 0.2 | Says it is from an older version and to ask for a new one |
-| Code cut short or mistyped | `Invalid session code. Check that you copied all of it...` if it no longer parses. If it still parses, its secret is wrong and it ends as "Other peer never seen" below |
+| Code cut short or mistyped | `Invalid session code. Check that you copied all of it...` at once: the checksum catches it (a typo slips through about once in 65,536) |
 | Old code | `This session code has expired. Ask your peer for a new one.` |
 | No direct path | `No direct path. You: ... Other peer: ...`, naming symmetric NAT, CGNAT or "cannot host" for each side, and pointing to `whisper doctor` |
-| Other peer never seen | After 60 s with no record from the creator: `The other peer never showed up. Check that the code is complete and that they are still waiting...`. Also what a wrong secret in the code ends in |
-| DHT unreachable | With a direct address in the code, only direct connections are tried. Without one, the joiner stops and says why |
+| Other peer never seen | After 60 s with no record from the creator: `The other peer never showed up. Check that the code is complete and that they are still waiting...`. Also what a well-formed code from another session ends in |
+| DHT unreachable | With a direct address in the code, only direct connections are tried, and a failure says the DHT is unreachable (or UDP seems blocked) instead of "never showed up". Without one, the joiner stops and says why: at once if the DHT cannot start, within about 10 s if neither a DHT node nor a STUN server answers |
 | Peer goes silent | `Connection to X lost.` in the chat |
 
 ### Unacceptable (never do this)
@@ -245,7 +274,8 @@ under 1200 bytes and is never fragmented.
 STUN servers. `stun.l.google.com` and `stun.cloudflare.com`, two operators, are asked from
 the same socket: the same external address from both means the NAT mapping does not depend
 on the destination (hole punching works), different addresses mean symmetric NAT. If
-neither answers, the others are tried just to learn the address:
+neither answers, the others are tried just to learn the address. The whole step takes 6 s at
+most:
 
 ```
 stun.l.google.com:19302
@@ -262,9 +292,10 @@ DHT: the default Mainline bootstrap nodes of the `mainline` crate, used as a cli
 
 ## Limitations (Documented, Not Hidden)
 
-1. **Symmetric NAT on both sides**: no direct path exists. The error says so
+1. **Symmetric NAT on both sides**, when neither side has IPv6 or a router port: no direct
+   path exists. The error says so
 2. **Both peers online**: they must be online at the same time. This is inherent to P2P
-3. **UDP only**: some networks block it. We fail explicitly
+3. **UDP only**: some networks block it. We fail explicitly, and say that UDP seems blocked
 4. **Single peer**: 1-to-1 chat. Groups would need a different design
 5. **No long-term identity**: the code (and password) is the only credential. See
    [SECURITY.md](SECURITY.md)

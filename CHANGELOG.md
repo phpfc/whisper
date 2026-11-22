@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Session code v3: `base58(3 || secret[16] || direct addresses)`, a 128-bit secret and up to
-  three direct addresses (router port, IPv6, LAN). About 69 characters at most. **Not
-  compatible with 0.2 codes**
+- Session code v3: `base58(3 || secret[16] || direct addresses || checksum)`, a 128-bit
+  secret, up to three direct addresses (router port, IPv6, LAN) and a 2-byte checksum that
+  rejects a mistyped code at once. 27 characters without addresses, 72 at most. Quotes
+  around a pasted code, typographic ones included, and invisible characters are ignored.
+  **Not compatible with 0.2 codes**
 - Connection by candidates: LAN, IPv6, router-mapped, STUN-reflexive and peer-reflexive
-  addresses. Both peers probe all of them at once, and the first path that completes the
-  handshake carries the chat, so whoever can be reached becomes the host automatically
+  addresses. Both peers probe all of them at once, and the joiner picks the
+  highest-priority path that answers, so whoever can be reached becomes the host
+  automatically
 - Automatic router port opening through UPnP, NAT-PMP and PCP, announced as
   `UDP port N opened on your router (closed on exit)` and removed on exit (Esc, Ctrl-C or
   end of session)
@@ -21,10 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hole punching between two NATs. No server run by the project
 - Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s` handshake, with a 64-packet anti-replay window and
   a session fingerprint shown on both sides
-- Authenticated connectivity probes, so the open port is not a reflector
+- Authenticated connectivity probes: no amplification, and no reply to unauthenticated
+  packets
 - `whisper doctor`, which reports IPv6, router port mapping, CGNAT, NAT mapping type and DHT
   reachability
 - Connection failures now say why, for both sides, instead of a generic timeout
+- When the DHT is unreachable or UDP seems blocked, the error says so. A joiner whose code
+  has no direct address stops within seconds on such a network instead of after a minute
+- A second Ctrl-C quits at once, without waiting for the router port to be released (it
+  then expires on its own)
 - A joiner using an expired code gets `This session code has expired. Ask your peer for a
   new one.`
 

@@ -24,14 +24,17 @@ adversary correlating traffic across the whole network.
   keys. No server, STUN server or DHT node sees a message
 - **Replay**: every packet carries a nonce, and a 64-packet window drops duplicates and
   anything too old
-- **Probes**: connectivity probes carry an HMAC tag derived from the code. Packets without a
-  valid tag get no reply, so the open port is not a reflector and does not answer scans
+- **Probes**: connectivity probes carry an HMAC tag derived from the code. A valid probe gets
+  exactly one answer, sent to its source, and packets without a valid tag get none: no
+  amplification and no reply to unauthenticated packets, so the open port does not answer
+  scans
 - **DHT records**: encrypted with ChaCha20-Poly1305 under a key derived from the code, and
-  signed with a key derived from it too. Without the code they can be neither found nor read
+  signed with a key derived from it too. Without the code they cannot be looked up or read
 - **Wrong password or code**: with the right code and a wrong password the handshake fails
-  and you get `wrong password or invalid code`. With a wrong code no handshake starts: its
-  probes do not verify, nobody answers, and the joiner ends with `The other peer never
-  showed up...`
+  and you get `wrong password or invalid code`. A mistyped code fails its checksum and is
+  rejected at once. A well-formed code with another secret starts no handshake: its probes
+  do not verify, nobody answers, and the joiner ends with `The other peer never showed
+  up...`
 - **Router port**: opened only while whisper runs and closed on exit. If the process is
   killed, the router drops it when its 2-hour lease ends, and nothing listens on it meanwhile
 
@@ -62,6 +65,9 @@ adversary correlating traffic across the whole network.
   whisper cannot check this for you, so do it over another channel
 - **Passwords can be guessed offline** by someone who has the code and recorded a handshake,
   slowed by Argon2id. Pick a long one
+- **Passwords can be guessed online** by someone who has the code, while the creator waits.
+  Each guess costs a full handshake round (and an Argon2id run on the guesser's side), and
+  the creator warns only once that someone used the wrong password. There is no lockout
 - **Your own machine**: whisper keeps no history, but your terminal's scrollback may
 - **Not audited**: the code has not been independently reviewed. Use it for conversations
   between people who trust each other, not as a hardened system

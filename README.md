@@ -53,7 +53,7 @@ UDP port 54321 opened on your router (closed on exit)
 ========================================
 SESSION CODE:
 
-  BGUUsqBDHSSwBjzHNZzr6i2xDb9yxSvxnjDGK4BdxHpCWQQx3ne73PfHUZd121wEAcxyW
+  4kE7Ytq0OIlXw9RbMz3NfVcH8pJs2LgAeQd5Ku6nTW1yBo0OIlCrmZxS7vGh4iDaFj9P   (example; yours will differ)
 
 Share this code with your peer.
 ========================================
@@ -62,11 +62,13 @@ Waiting for your peer to join... (Ctrl-C to cancel)
 ```
 
 The `UDP port ... opened` line only appears if your router granted a port. Send the code to
-your peer over any channel (WhatsApp, SMS, email). The creator waits up to 10 minutes.
+your peer over any channel (WhatsApp, SMS, email). The creator waits up to 10 minutes for
+someone to join. If a peer shows up but no direct path is possible, it says why within about
+45 seconds.
 
 ### Join a session
 ```bash
-whisper join "BGUUsqBDHSSwBjzHNZzr6i2xDb9yxSvxnjDGK4BdxHpCWQQx3ne73PfHUZd121wEAcxyW" -u bob
+whisper join "<code>" -u bob
 ```
 
 Once the connection is up, each side sees something like this:
@@ -92,9 +94,11 @@ whisper join "<code>" -u bob -p mysecret
 ```
 
 A wrong password fails with `wrong password or invalid code`. A code that is cut short or
-mistyped is rejected at once with `Invalid session code...` if it no longer parses. If it still
-parses but carries the wrong secret, nobody answers the joiner, and after about a minute it
-ends with `The other peer never showed up...`.
+mistyped is rejected at once with `Invalid session code...`: the code ends in a checksum that
+catches typos (all but about one in 65,000). A well-formed code with a different secret, such
+as one from an older session, finds nobody to answer, and after about a minute the joiner
+ends with `The other peer never showed up...`. Quotes around the code, typographic ones
+included, and invisible characters that chat apps add when copying are ignored.
 
 ### Check your network
 ```bash
@@ -122,16 +126,18 @@ Verdict:       can likely reach peers that have IPv6
 | DHT | Whether the BitTorrent DHT is reachable, and how long it took to bootstrap |
 | Verdict | One line: `can host sessions`, `can likely reach peers that have IPv6`, `cannot host; hole punching likely works` or `direct connections unlikely from this network` |
 
-If doctor opens a router port to test it, it closes it again before exiting. When a
-connection fails, the error message says what is wrong with each side and points here.
+Doctor says so before it opens a router port to test it, and closes it again before exiting.
+When a connection fails, the error message says what is wrong with each side and points here.
 
 ## How It Works
 
 Each peer gathers **candidates**, the addresses where it might be reached. Both peers then
-try every pair of candidates at once, in both directions, and the first path that completes
-the encrypted handshake becomes the chat. Nobody is "the server": whoever has a reachable
-address ends up being the one the other connects to. These are the ways it can connect, from
-simplest to most involved; whisper uses the first one that works:
+probe all of the other's candidates at once, in both directions. Among the paths that answer,
+the joiner prefers the one with the highest priority (`lan`, then `ipv6`, `mapped`,
+`reflexive`, `peer-reflexive`) and runs the encrypted handshake on it. Nobody is "the
+server": whoever has a reachable address ends up being the one the other connects to. These
+are the ways it can connect, from simplest to most involved. They are all tried at the same
+time, not one after the other:
 
 1. **LAN or IPv6.** Peers on the same network, or with public IPv6 addresses, connect with
    no NAT in the way.
@@ -140,7 +146,8 @@ simplest to most involved; whisper uses the first one that works:
    inside the session code (along with your IPv6 and LAN addresses, if you have them), so
    your peer can connect right away. The port is removed when you leave (Esc, Ctrl-C or
    the end of the session). The router's lease is 2 hours, so if the process is killed the
-   mapping lingers until it expires, pointing at a closed port.
+   mapping lingers until it expires, pointing at a closed port. A second Ctrl-C while the
+   port is being released quits at once and leaves it to expire the same way.
 3. **Hole punching through the DHT.** Each peer publishes its candidates as an encrypted
    record on the public BitTorrent Mainline DHT, and reads the other's. Knowing where the
    other is, both send packets at the same time, which opens a path through both NATs.
@@ -156,7 +163,7 @@ simplest to most involved; whisper uses the first one that works:
                    └──────── BitTorrent DHT ────────┘
   read Bob's record                                     read Alice's record
         └── both probe every candidate every 200 ms ──┘
-              first path with a valid handshake = chat
+        best path that answers + valid handshake = chat
 ```
 
 Probes and the handshake are authenticated with keys derived from the code, so packets from
@@ -177,7 +184,7 @@ macOS and most Linux desktops need nothing.
 | Who | What they see |
 |-----|---------------|
 | STUN servers (Google, Cloudflare) | Your public IP address. Not the code, not your messages |
-| BitTorrent DHT nodes | An encrypted blob, plus the IP of whoever publishes or looks it up. Without the code the record cannot be found or read |
+| BitTorrent DHT nodes | An encrypted blob, plus the IP of whoever publishes or looks it up. Without the code the record cannot be looked up or read |
 | Your peer | Your public IP (any direct connection needs it), the other addresses you advertise (LAN, IPv6) and your username |
 | Your messages | Only you and your peer. No server, STUN server or DHT node ever sees them |
 
@@ -195,16 +202,17 @@ More in [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- **Symmetric NAT on both sides**: if both peers are behind symmetric NAT, no direct path
-  exists, and without a relay they cannot connect. The error tells you so. Try another
-  network, such as Wi-Fi instead of mobile data.
+- **Symmetric NAT on both sides**: if both peers are behind symmetric NAT and neither has
+  IPv6 or a router port, no direct path exists, and without a relay they cannot connect.
+  The error tells you so. Try another network, such as Wi-Fi instead of mobile data.
 - **Codes expire**: the creator stops waiting after 10 minutes. A joiner using an old code
   gets `This session code has expired. Ask your peer for a new one.` about 10 seconds
   later.
 - **Both online**: both peers must be online at the same time.
 - **1-to-1 only**: two participants per session.
 - **Messages are at most 1000 bytes.**
-- **UDP only**: networks that block UDP cannot be used.
+- **UDP only**: networks that block UDP cannot be used. When no STUN server and no DHT node
+  answers, the error says that UDP seems blocked.
 - **Code format**: session codes changed and are not compatible with 0.2.
 
 ## License

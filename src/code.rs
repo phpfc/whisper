@@ -252,6 +252,28 @@ mod tests {
         assert_eq!(SessionCode::decode(KNOWN_CODE).unwrap(), code);
     }
 
+    /// The words of `text` that decode as a session code.
+    fn real_codes_in(text: &str) -> Vec<&str> {
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| word.len() >= 20 && SessionCode::decode(word).is_ok())
+            .collect()
+    }
+
+    /// An example in the docs that decodes is a code with a public secret:
+    /// whoever pastes it publishes their addresses where anyone can read them.
+    #[test]
+    fn no_example_in_the_docs_is_a_real_code() {
+        assert_eq!(real_codes_in(&format!("run `{KNOWN_CODE}`.")), [KNOWN_CODE]);
+        for doc in [
+            include_str!("../README.md"),
+            include_str!("../ARCHITECTURE.md"),
+            include_str!("../SECURITY.md"),
+            include_str!("../CHANGELOG.md"),
+        ] {
+            assert_eq!(real_codes_in(doc), Vec::<&str>::new());
+        }
+    }
+
     #[test]
     fn rejects_old_truncated_and_foreign_codes() {
         let old = SessionCode::decode("203.45.67.89:54321#7kJ9xnYpQm#QgT98sXCthe3").unwrap_err();
