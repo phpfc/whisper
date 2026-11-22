@@ -76,7 +76,6 @@ JOINER_RC=-1
 JOINER_SECS=0
 PASSED=0
 FAILED=0
-RESULTS=()
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -503,7 +502,6 @@ conclude() {
   local name=$1 reason="" problem
   if ((${#PROBLEMS[@]} == 0)); then
     echo "PASS $name"
-    RESULTS+=("PASS $name")
     PASSED=$((PASSED + 1))
     return 0
   fi
@@ -511,7 +509,6 @@ conclude() {
     reason+="${reason:+; }$problem"
   done
   echo "FAIL $name: $reason"
-  RESULTS+=("FAIL $name: $reason")
   FAILED=$((FAILED + 1))
   printf '\n----- %s: output of both peers and of the lab services -----\n' "$name"
   dump_logs
@@ -557,7 +554,7 @@ run_scenarios() {
   # name                  creator joiner  ra         rb         expectation
   scenario cone-cone            a1 b1 cone      cone      check_connected 'reflexive|peer-reflexive' 'reflexive|peer-reflexive'
   scenario same-lan             a1 a2 cone      cone      check_connected 'lan|peer-reflexive' 'lan'
-  scenario symmetric-cone       a1 b1 symmetric cone      check_no_path 'No direct path'
+  scenario symmetric-cone       a1 b1 symmetric cone      check_no_path 'No direct path' 'Other peer: symmetric NAT'
   scenario symmetric-symmetric  a1 b1 symmetric symmetric check_no_path 'No direct path' 'symmetric NAT'
 }
 
@@ -597,13 +594,8 @@ main() {
 
   run_scenarios
 
+  # Each verdict was printed as its scenario ended: only the counts here.
   phase "Summary"
-  local line
-  if ((${#RESULTS[@]} > 0)); then
-    for line in "${RESULTS[@]}"; do
-      echo "$line"
-    done
-  fi
   echo "$PASSED passed, $FAILED failed"
   if ((PASSED + FAILED == 0)); then
     die "no scenario ran"
