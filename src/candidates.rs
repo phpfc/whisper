@@ -121,35 +121,55 @@ pub fn primary_v4() -> Option<Ipv4Addr> {
     }
 }
 
+/// The global IPv6 address the OS would send from to reach the internet
+/// (often a temporary privacy address).
+///
+/// Connecting a UDP socket only picks a route; no packet is sent.
+pub fn preferred_v6() -> Option<Ipv6Addr> {
+    let socket = UdpSocket::bind("[::]:0").ok()?;
+    socket.connect("[2001:4860:4860::8888]:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V6(ip) if is_global_v6(&ip) => Some(ip),
+        _ => None,
+    }
+}
+
 /// Candidates derived from local interface addresses.
 ///
 /// `Lan` only for private IPv4 (never CGNAT, which keeps VPN addresses such as
-/// Tailscale's 100.x out), at most 2, in the order given. `Ipv6` only for
-/// global addresses, at most 3, and only when there is an IPv6 socket
-/// (`v6_port`).
-pub fn local_candidates(addrs: &[IpAddr], v4_port: u16, v6_port: Option<u16>) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    let (mut lan, mut ipv6) = (0, 0);
-    for addr in addrs {
-        match addr {
-            IpAddr::V4(ip) if classify_v4(*ip) == V4Class::Private && lan < MAX_LAN => {
-                lan += 1;
-                out.push(Candidate {
-                    kind: CandidateKind::Lan,
-                    addr: SocketAddr::new(*addr, v4_port),
-                });
-            }
-            IpAddr::V6(ip) if is_global_v6(ip) && ipv6 < MAX_IPV6 => {
-                if let Some(port) = v6_port {
-                    ipv6 += 1;
-                    out.push(Candidate {
-                        kind: CandidateKind::Ipv6,
-                        addr: SocketAddr::new(*addr, port),
-                    });
-                }
-            }
-            _ => {}
+/// Tailscale's 100.x out), at most 2, in the order given.
+///
+/// `Ipv6` only when there is an IPv6 socket, `v6` being its local address. A
+/// socket bound to one global address gives exactly that candidate: every
+/// reply and probe leaves from it, and a peer's stateful firewall only lets
+/// in what comes from the address it sent to. A socket bound to `[::]` gives
+/// the global addresses of `addrs`, at most 3, in the order given.
+pub fn local_candidates(addrs: &[IpAddr], v4_port: u16, v6: Option<SocketAddr>) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = addrs
+        .iter()
+        .filter(|addr| matches!(addr, IpAddr::V4(ip) if classify_v4(*ip) == V4Class::Private))
+        .take(MAX_LAN)
+        .map(|addr| Candidate {
+            kind: CandidateKind::Lan,
+            addr: SocketAddr::new(*addr, v4_port),
+        })
+        .collect();
+    let ipv6 = |addr: SocketAddr| Candidate {
+        kind: CandidateKind::Ipv6,
+        addr,
+    };
+    match v6 {
+        Some(SocketAddr::V6(bound)) if bound.ip().is_unspecified() => out.extend(
+            addrs
+                .iter()
+                .filter(|addr| matches!(addr, IpAddr::V6(ip) if is_global_v6(ip)))
+                .take(MAX_IPV6)
+                .map(|addr| ipv6(SocketAddr::new(*addr, bound.port()))),
+        ),
+        Some(SocketAddr::V6(bound)) if is_global_v6(bound.ip()) => {
+            out.push(ipv6(SocketAddr::V6(bound)));
         }
+        _ => {}
     }
     out
 }
@@ -237,12 +257,35 @@ mod tests {
         let addrs: Vec<IpAddr> = ["192.168.0.10", "10.0.0.5", "172.16.0.9", "100.100.1.1",
             "2804::1", "2804::2", "2804::3", "2804::4", "fe80::1"]
             .iter().map(|s| s.parse().unwrap()).collect();
-        let c = local_candidates(&addrs, 4000, Some(5000));
+        let c = local_candidates(&addrs, 4000, Some("[::]:5000".parse().unwrap()));
         let lan: Vec<_> = c.iter().filter(|c| c.kind == CandidateKind::Lan).map(|c| c.addr).collect();
         assert_eq!(lan, vec!["192.168.0.10:4000".parse().unwrap(), "10.0.0.5:4000".parse().unwrap()]);
         assert_eq!(c.iter().filter(|c| c.kind == CandidateKind::Ipv6).count(), 3);
         assert!(c.iter().all(|c| c.addr.ip() != "100.100.1.1".parse::<IpAddr>().unwrap()));
         assert!(local_candidates(&addrs, 4000, None).iter().all(|c| c.kind == CandidateKind::Lan));
+    }
+
+    #[test]
+    fn a_socket_bound_to_one_ipv6_address_advertises_only_that_one() {
+        let addrs: Vec<IpAddr> = ["192.168.0.10", "2804::1", "2804::2", "fe80::1"]
+            .iter().map(|s| s.parse().unwrap()).collect();
+        let ipv6 = |v6: &str| -> Vec<SocketAddr> {
+            local_candidates(&addrs, 4000, Some(v6.parse().unwrap()))
+                .into_iter().filter(|c| c.kind == CandidateKind::Ipv6).map(|c| c.addr).collect()
+        };
+        // Bound to the preferred source address: that is where replies come
+        // from, so it is the only one, listed on the interfaces or not.
+        assert_eq!(ipv6("[2804::2]:5000"), vec!["[2804::2]:5000".parse().unwrap()]);
+        assert_eq!(ipv6("[2804::9]:5000"), vec!["[2804::9]:5000".parse().unwrap()]);
+        // Bound to [::]: the interface addresses, as before.
+        assert_eq!(ipv6("[::]:5000"), vec!["[2804::1]:5000".parse().unwrap(), "[2804::2]:5000".parse().unwrap()]);
+        // A non-global bound address advertises nothing.
+        assert!(ipv6("[fe80::1]:5000").is_empty());
+    }
+
+    #[test]
+    fn the_preferred_ipv6_address_is_global_when_there_is_one() {
+        assert!(preferred_v6().is_none_or(|ip| is_global_v6(&ip)));
     }
 
     #[test]

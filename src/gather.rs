@@ -11,8 +11,8 @@ use tokio::time::Instant;
 
 use crate::cancel::{Cancel, Cancelled};
 use crate::candidates::{
-    detect_cgnat, interface_addrs, is_global_v6, local_candidates, mapped_candidate, primary_v4,
-    Candidate, CandidateKind,
+    detect_cgnat, interface_addrs, is_global_v6, local_candidates, mapped_candidate, preferred_v6,
+    primary_v4, Candidate, CandidateKind,
 };
 use crate::portmap::{PortMap, ProbeFlags};
 use crate::stun::{self, NatMapping};
@@ -32,16 +32,36 @@ pub struct Sockets {
 
 /// Binds the IPv4 socket and, when the machine has a global IPv6 address, an
 /// IPv6 one (best effort: a failed IPv6 bind just means no IPv6 socket).
-pub async fn bind_sockets(has_global_v6: bool) -> Result<Sockets> {
+///
+/// The IPv6 socket goes on `preferred_v6`, the address the OS would send
+/// from, so that what we send leaves from the address we advertise. Left on
+/// `[::]` the OS picks the source per packet, often a temporary privacy
+/// address the peer never heard of, and its firewall drops the packet.
+pub async fn bind_sockets(has_global_v6: bool, preferred_v6: Option<Ipv6Addr>) -> Result<Sockets> {
     let v4 = UdpSocket::bind("0.0.0.0:0")
         .await
         .context("failed to bind a UDP socket")?;
-    let v6 = if has_global_v6 {
-        UdpSocket::bind("[::]:0").await.ok()
-    } else {
-        None
-    };
+    let mut v6 = None;
+    if has_global_v6 {
+        for addr in v6_bind_order(preferred_v6) {
+            if let Ok(socket) = UdpSocket::bind(addr).await {
+                v6 = Some(socket);
+                break;
+            }
+        }
+    }
     Ok(Sockets { v4, v6 })
+}
+
+/// Where the IPv6 socket is bound, in order of preference: the preferred
+/// source address if there is one, else (or if that fails) any address.
+fn v6_bind_order(preferred: Option<Ipv6Addr>) -> Vec<SocketAddr> {
+    let any = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
+    preferred
+        .map(|ip| SocketAddr::new(ip.into(), 0))
+        .into_iter()
+        .chain([any])
+        .collect()
 }
 
 /// What this network allows, in short.
@@ -99,11 +119,17 @@ fn v4_ip(addr: Option<SocketAddr>) -> Option<Ipv4Addr> {
     }
 }
 
-/// Interface addresses with the default-route IPv4 first, then the rest in
-/// their original order, without repeats. `local_candidates` keeps only a few
-/// `Lan` entries, and this keeps a Docker/VM bridge from taking their place.
-fn ordered_addrs(primary: Option<Ipv4Addr>, addrs: Vec<IpAddr>) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = primary.map(IpAddr::V4).into_iter().collect();
+/// Interface addresses with the default-route IPv4 and IPv6 first, then the
+/// rest in their original order, without repeats. `local_candidates` keeps
+/// only a few entries of each kind, and this keeps a Docker/VM bridge from
+/// taking their place.
+fn ordered_addrs(
+    primary_v4: Option<Ipv4Addr>,
+    preferred_v6: Option<Ipv6Addr>,
+    addrs: Vec<IpAddr>,
+) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = primary_v4.map(IpAddr::V4).into_iter().collect();
+    out.extend(preferred_v6.map(IpAddr::V6));
     for addr in addrs {
         if !out.contains(&addr) {
             out.push(addr);
@@ -119,14 +145,15 @@ fn ordered_addrs(primary: Option<Ipv4Addr>, addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 /// already requested is released first, so nothing stays open on the router.
 pub async fn gather(cancel: &Cancel) -> Result<Gathered> {
     let primary = primary_v4();
-    let addrs = ordered_addrs(primary, interface_addrs());
+    let preferred = preferred_v6();
+    let addrs = ordered_addrs(primary, preferred, interface_addrs());
     let has_global_v6 = addrs
         .iter()
         .any(|a| matches!(a, IpAddr::V6(ip) if is_global_v6(ip)));
-    let sockets = bind_sockets(has_global_v6).await?;
+    let sockets = bind_sockets(has_global_v6, preferred).await?;
     let v4_port = sockets.v4.local_addr()?.port();
-    let v6_port = match &sockets.v6 {
-        Some(s) => Some(s.local_addr()?.port()),
+    let v6_local = match &sockets.v6 {
+        Some(s) => Some(s.local_addr()?),
         None => None,
     };
 
@@ -143,7 +170,7 @@ pub async fn gather(cancel: &Cancel) -> Result<Gathered> {
     )
     .await?;
 
-    let mut candidates = local_candidates(&addrs, v4_port, v6_port);
+    let mut candidates = local_candidates(&addrs, v4_port, v6_local);
     let ipv6_addr = candidates.iter().find_map(|c| match c.addr {
         SocketAddr::V6(a) if c.kind == CandidateKind::Ipv6 => Some(*a.ip()),
         _ => None,
@@ -287,13 +314,37 @@ mod tests {
             ip("172.17.0.1"),
         ];
         assert_eq!(
-            ordered_addrs(Some("192.168.1.10".parse().unwrap()), all.clone()),
+            ordered_addrs(Some("192.168.1.10".parse().unwrap()), None, all.clone()),
             vec![ip("192.168.1.10"), ip("172.17.0.1"), ip("fe80::1")]
         );
         assert_eq!(
-            ordered_addrs(None, all),
+            ordered_addrs(None, None, all),
             vec![ip("172.17.0.1"), ip("192.168.1.10"), ip("fe80::1")]
         );
+    }
+
+    #[test]
+    fn the_preferred_ipv6_address_goes_first_among_the_ipv6_ones() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let all = vec![ip("2804::1"), ip("192.168.1.10"), ip("2804::2")];
+        assert_eq!(
+            ordered_addrs(
+                Some("192.168.1.10".parse().unwrap()),
+                Some("2804::2".parse().unwrap()),
+                all
+            ),
+            vec![ip("192.168.1.10"), ip("2804::2"), ip("2804::1")]
+        );
+    }
+
+    #[test]
+    fn the_ipv6_socket_tries_the_preferred_address_then_any() {
+        let pref: Ipv6Addr = "2804::2".parse().unwrap();
+        assert_eq!(
+            v6_bind_order(Some(pref)),
+            vec![SocketAddr::new(pref.into(), 0), "[::]:0".parse().unwrap()]
+        );
+        assert_eq!(v6_bind_order(None), vec!["[::]:0".parse().unwrap()]);
     }
 
     #[test]
@@ -301,7 +352,7 @@ mod tests {
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
         // Docker and VM bridges are listed before the real interface.
         let all = vec![ip("172.17.0.1"), ip("192.168.56.1"), ip("192.168.1.10")];
-        let addrs = ordered_addrs(Some("192.168.1.10".parse().unwrap()), all);
+        let addrs = ordered_addrs(Some("192.168.1.10".parse().unwrap()), None, all);
         let lan: Vec<_> = local_candidates(&addrs, 4000, None)
             .into_iter()
             .map(|c| c.addr.ip())
