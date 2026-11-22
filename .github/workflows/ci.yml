@@ -1,0 +1,52 @@
+name: CI
+
+# Pushes to main and pull requests only: a push to a branch with an open pull
+# request would otherwise run everything twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Tests marked #[ignore] are not run.
+      - name: Run tests
+        run: cargo test
+
+  natlab:
+    name: NAT lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # `--examples` alone does not build the whisper binary itself.
+      - name: Build whisper and the lab helpers
+        run: cargo build --release --bins --examples
+
+      # Network namespaces and iptables need root.
+      - name: Run the NAT lab
+        run: sudo scripts/natlab.sh
